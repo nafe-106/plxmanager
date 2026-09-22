@@ -65,6 +65,8 @@ export default function KaggleManager() {
   const [showAccountForm, setShowAccountForm] = useState(false);
   const [showSessionForm, setShowSessionForm] = useState(false);
   const [showStartForm, setShowStartForm] = useState(false);
+  const [editAccount, setEditAccount] = useState<Account | null>(null);
+  const [editSession, setEditSession] = useState<Session | null>(null);
   const [gpuOverride, setGpuOverride] = useState<Account | null>(null);
   const [toast, setToast] = useState("");
 
@@ -271,6 +273,7 @@ export default function KaggleManager() {
                           <Progress pct={usedPct} />
                         </div>
                         <div className="flex gap-1.5">
+                          <Button variant="secondary" onClick={() => setEditAccount(a)} title="Edit this account's label, username, tokens, quota and reset day">Edit</Button>
                           <Button variant="secondary" disabled={busy("quota-" + a.id)} title="Fetch the real weekly GPU usage from Kaggle (POST /kernels/quota)"
                             onClick={() => refreshQuota(a)}>
                             {busy("quota-" + a.id) ? "Refreshing…" : "Refresh quota"}
@@ -361,6 +364,7 @@ export default function KaggleManager() {
                     ) : null}
 
                     <div className="flex flex-wrap gap-1.5">
+                      <Button variant="secondary" onClick={() => setEditSession(s)} title="Edit this session's slug, label, type, account and auto-switch">Edit</Button>
                       <Button variant="secondary" disabled={busy("check-" + s.id)} onClick={() => checkSession(s)}>
                         {busy("check-" + s.id) ? "Checking…" : "Check"}
                       </Button>
@@ -424,6 +428,27 @@ export default function KaggleManager() {
           }}
         />
       )}
+      {editAccount && (
+        <AccountForm
+          account={editAccount}
+          onClose={() => setEditAccount(null)}
+          onSaved={async () => {
+            await load();
+            setEditAccount(null);
+          }}
+        />
+      )}
+      {editSession && (
+        <SessionForm
+          accounts={accounts}
+          session={editSession}
+          onClose={() => setEditSession(null)}
+          onSaved={async () => {
+            await load();
+            setEditSession(null);
+          }}
+        />
+      )}
       {showStartForm && (
         <StartSessionForm
           accounts={accounts}
@@ -443,18 +468,20 @@ export default function KaggleManager() {
 }
 
 function AccountForm({
+  account,
   onClose,
   onSaved,
 }: {
+  account?: Account | null;
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [label, setLabel] = useState("");
-  const [username, setUsername] = useState("");
+  const [label, setLabel] = useState(account?.label ?? "");
+  const [username, setUsername] = useState(account?.username ?? "");
   const [apiKey, setApiKey] = useState("");
   const [refreshToken, setRefreshToken] = useState("");
-  const [quota, setQuota] = useState("30");
-  const [resetDay, setResetDay] = useState("0");
+  const [quota, setQuota] = useState(account ? String(account.weekly_gpu_quota_h) : "30");
+  const [resetDay, setResetDay] = useState(account ? String(account.week_reset_day) : "0");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -463,10 +490,13 @@ function AccountForm({
     setBusy(true);
     setError("");
     try {
-      const res = await fetch("/api/kaggle/accounts", {
-        method: "POST",
+      const body: Record<string, unknown> = { label, username, weeklyGpuQuotaH: Number(quota), weekResetDay: Number(resetDay) };
+      if (apiKey.trim()) body.apiKey = apiKey.trim();
+      if (refreshToken.trim() !== "" || !account) body.refreshToken = refreshToken.trim();
+      const res = await fetch(account ? `/api/kaggle/accounts/${account.id}` : "/api/kaggle/accounts", {
+        method: account ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ label, username, apiKey, refreshToken, weeklyGpuQuotaH: Number(quota), weekResetDay: Number(resetDay) }),
+        body: JSON.stringify(body),
       });
       const j = await res.json();
       if (!res.ok) {
@@ -479,17 +509,22 @@ function AccountForm({
     }
   }
 
+  const editing = !!account;
+
   return (
-    <Modal title="Add Kaggle account" onClose={onClose}>
+    <Modal title={editing ? `Edit Kaggle account — ${account?.label ?? ""}` : "Add Kaggle account"} onClose={onClose}>
       <form onSubmit={submit} className="space-y-3">
+        {editing && apiKey === "" && (
+          <p className="text-[11px] text-amber-300/80">Leave the token fields empty to keep the current values.</p>
+        )}
         <Field label="Label *"><input className={inputCls} required value={label} onChange={(e) => setLabel(e.target.value)} placeholder="e.g. acc-1" /></Field>
         <Field label="Kaggle username *"><input className={inputCls} required value={username} onChange={(e) => setUsername(e.target.value)} placeholder="username" /></Field>
         <Field label="Kaggle access token *">
-          <input type="password" autoComplete="new-password" className={inputCls} required value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="KGAT_… (Bearer) or legacy key" />
-          <p className="text-[11px] text-zinc-500">KGAT_ tokens are sent as Bearer; older kaggle.json keys use username:key Basic auth.</p>
+          <input type="password" autoComplete="new-password" className={inputCls} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder={editing ? "unchanged" : "KGAT_… (Bearer) or legacy key"} />
+          {!editing && <p className="text-[11px] text-zinc-500">KGAT_ tokens are sent as Bearer; older kaggle.json keys use username:key Basic auth.</p>}
         </Field>
         <Field label="Refresh token (KGRT_ …) — optional">
-          <input type="password" autoComplete="new-password" className={inputCls} value={refreshToken} onChange={(e) => setRefreshToken(e.target.value)} placeholder="KGRT_… keeps the access token alive past 3h" />
+          <input type="password" autoComplete="new-password" className={inputCls} value={refreshToken} onChange={(e) => setRefreshToken(e.target.value)} placeholder={editing ? "unchanged" : "KGRT_… keeps the access token alive past 3h"} />
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Weekly GPU quota (hours)"><input type="number" min="0" className={inputCls} value={quota} onChange={(e) => setQuota(e.target.value)} /></Field>
@@ -504,7 +539,7 @@ function AccountForm({
         {error && <p className="text-sm text-red-400">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button variant="secondary" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" type="submit" disabled={busy}>{busy ? "Saving…" : "Add account"}</Button>
+          <Button variant="primary" type="submit" disabled={busy}>{busy ? "Saving…" : editing ? "Save changes" : "Add account"}</Button>
         </div>
       </form>
     </Modal>
@@ -513,18 +548,20 @@ function AccountForm({
 
 function SessionForm({
   accounts,
+  session,
   onClose,
   onSaved,
 }: {
   accounts: Account[];
+  session?: Session | null;
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const [accountId, setAccountId] = useState(String(accounts[0]?.id ?? ""));
-  const [slug, setSlug] = useState("");
-  const [label, setLabel] = useState("");
-  const [type, setType] = useState("notebook");
-  const [autoSwitch, setAutoSwitch] = useState(true);
+  const [accountId, setAccountId] = useState(session ? String(session.account_id) : String(accounts[0]?.id ?? ""));
+  const [slug, setSlug] = useState(session?.slug ?? "");
+  const [label, setLabel] = useState(session?.label ?? "");
+  const [type, setType] = useState(session?.type ?? "notebook");
+  const [autoSwitch, setAutoSwitch] = useState(session ? session.auto_switch === 1 : true);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -533,10 +570,12 @@ function SessionForm({
     setBusy(true);
     setError("");
     try {
-      const res = await fetch("/api/kaggle/sessions", {
-        method: "POST",
+      const body: Record<string, unknown> = { accountId: Number(accountId), slug, label, type, autoSwitch };
+      const url = session ? `/api/kaggle/sessions/${session.id}` : "/api/kaggle/sessions";
+      const res = await fetch(url, {
+        method: session ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ accountId: Number(accountId), slug, label, type, autoSwitch }),
+        body: JSON.stringify(body),
       });
       const j = await res.json();
       if (!res.ok) {
@@ -549,14 +588,18 @@ function SessionForm({
     }
   }
 
+  const editing = !!session;
+
   return (
-    <Modal title="Add watched session" onClose={onClose}>
+    <Modal title={editing ? `Edit session — ${session?.label || session?.slug || ""}` : "Add watched session"} onClose={onClose}>
       <form onSubmit={submit} className="space-y-3">
         <Field label="Account *">
           <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)} required>
-            {accounts.filter((a) => !a.disabled).map((a) => (
-              <option key={a.id} value={a.id}>{a.label} (@{a.username})</option>
-            ))}
+            {accounts
+              .filter((a) => !a.disabled || (editing && a.id === session?.account_id))
+              .map((a) => (
+                <option key={a.id} value={a.id}>{a.label} (@{a.username})</option>
+              ))}
           </select>
         </Field>
         <Field label="Type">
@@ -576,7 +619,7 @@ function SessionForm({
         {error && <p className="text-sm text-red-400">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button variant="secondary" onClick={onClose}>Cancel</Button>
-          <Button variant="primary" type="submit" disabled={busy || !accounts.length}>{busy ? "Saving…" : "Add session"}</Button>
+          <Button variant="primary" type="submit" disabled={busy || !accounts.length}>{busy ? "Saving…" : editing ? "Save changes" : "Add session"}</Button>
         </div>
       </form>
     </Modal>

@@ -1,35 +1,18 @@
 import crypto from "node:crypto";
-import { db } from "./db";
 
 // ----- Encryption key resolution -----------------------------------------
-// Precedence: ENCRYPTION_KEY env -> settings.encryption_key -> generate & persist.
+// The key comes from ENCRYPTION_KEY env ONLY. It must be identical on every
+// instance (see .env) because encrypted values live in the shared Supabase DB.
 export function encKeyHex(): string {
   const env = process.env.ENCRYPTION_KEY?.trim();
   if (env) return env;
-
-  const stored = getSetting("encryption_key");
-  if (stored) return stored;
-
-  const generated = crypto.randomBytes(32).toString("hex");
-  setSetting("encryption_key", generated);
-  return generated;
+  throw new Error(
+    "ENCRYPTION_KEY is not set — set it to the same value on every instance (.env / Vercel env)"
+  );
 }
 
 export function encKeyBuffer(): Buffer {
   return crypto.createHash("sha256").update(encKeyHex()).digest();
-}
-
-function getSetting(key: string): string | null {
-  const row = db
-    .prepare("SELECT value FROM settings WHERE key = ?")
-    .get(key) as { value: string } | undefined;
-  return row?.value ?? null;
-}
-
-function setSetting(key: string, value: string): void {
-  db.prepare(
-    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-  ).run(key, value);
 }
 
 // ----- Encrypt / decrypt --------------------------------------------------

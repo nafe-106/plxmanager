@@ -1,38 +1,38 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
-import { db } from "@/lib/db";
+import { rows } from "@/lib/store";
 import { timezone } from "@/lib/settings";
 import { activeAlerts } from "@/lib/alerts";
-import { kaggleOverview, runAutoSwitcher, watchKaggle, getAccount, gpuRemainingHours } from "@/lib/kaggle";
+import { kaggleOverview, getAccount, gpuRemainingHours, watchKaggle, runAutoSwitcher } from "@/lib/kaggle";
 import { PROVIDERS } from "@/lib/providers";
-
-function todayInTz(zone: string): string {
-  const f = new Intl.DateTimeFormat("en-US", {
-    timeZone: zone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  const parts: Record<string, string> = {};
-  for (const p of f.formatToParts(new Date())) if (p.type !== "literal") parts[p.type] = p.value;
-  return `${parts.year}-${parts.month}-${parts.day}`;
-}
 
 export async function GET() {
   const g = await guard();
   if (g) return g;
-  const zone = timezone();
+  const zone = await timezone();
 
-  const keyRows = db.prepare("SELECT * FROM api_keys WHERE disabled = 0").all() as any[];
+  const keyRows = await rows<any>("api_keys", { disabled: 0 });
   const total = keyRows.length;
   const alive = keyRows.filter((k) => k.status === "alive").length;
   const dead = keyRows.filter((k) => k.status === "dead").length;
   const rateLimited = keyRows.filter((k) => k.status === "rate_limited").length;
   const unknown = keyRows.filter((k) => ["unknown", "queued"].includes(k.status)).length;
 
-  const todayRow = db
-    .prepare(`SELECT COALESCE(SUM(tokens),0) t FROM key_usage_hourly WHERE day = ?`)
-    .get(todayInTz(zone)) as { t: number };
+  const today = new Intl.DateTimeFormat("en-US", {
+    timeZone: zone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  })
+    .formatToParts(new Date())
+    .reduce<Record<string, string>>((acc, p) => {
+      if (p.type !== "literal") acc[p.type] = p.value;
+      return acc;
+    }, {});
+  const todayKey = `${today.year}-${today.month}-${today.day}`;
+
+  const usageRows = await rows<{ tokens: number }>("key_usage_hourly", { day: todayKey });
+  const tokensToday = usageRows.reduce((s, r) => s + (r.tokens ?? 0), 0);
 
   const deadKeys = keyRows
     .filter((k) => k.status === "dead")
@@ -45,14 +45,20 @@ export async function GET() {
     }))
     .slice(0, 8);
 
-  const kaggle = kaggleOverview();
+  const kaggle = await kaggleOverview();
 
-  const accounts = (db.prepare("SELECT * FROM kaggle_accounts WHERE disabled = 0").all() as any[]).map(
-    (a) => {
-      const account = getAccount(a.id)!;
-      return { id: a.id, label: a.label, username: a.username, remaining: gpuRemainingHours(account) };
-    }
-  );
+  const accountRows = await rows<any>("kaggle_accounts", { disabled: 0 });
+  const accounts = [];
+  for (const a of accountRows) {
+    const account = await getAccount(a.id);
+    if (!account) continue;
+    accounts.push({
+      id: a.id,
+      label: a.label,
+      username: a.username,
+      remaining: await gpuRemainingHours(account),
+    });
+  }
 
   // Sniff fresh status as the dashboard loads so it is never stale.
   void watchKaggle().catch(() => {});
@@ -60,10 +66,10 @@ export async function GET() {
 
   return NextResponse.json({
     providerOptions: PROVIDERS.map((p) => ({ id: p.id, label: p.label, color: p.color })),
-    keys: { total, alive, dead, rateLimited, unknown, tokensToday: todayRow.t, deadKeys },
+    keys: { total, alive, dead, rateLimited, unknown, tokensToday, deadKeys },
     kaggle,
     accounts,
-    alerts: activeAlerts(),
+    alerts: await activeAlerts(),
     timezone: zone,
     lastUpdated: new Date().toISOString(),
   });

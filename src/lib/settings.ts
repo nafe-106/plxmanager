@@ -1,4 +1,4 @@
-import { db } from "./db";
+import { row, rows, upsertRows } from "./store";
 
 export type SettingsMap = Record<string, string>;
 
@@ -31,42 +31,38 @@ const ENV_FALLBACK: Partial<Record<string, () => string | undefined>> = {
   plexus_token: () => process.env.PLEXUS_TOKEN || "PLEXUS_KAGGLE_2026",
 };
 
-export function getSetting(key: string): string | null {
-  const row = db
-    .prepare("SELECT value FROM settings WHERE key = ?")
-    .get(key) as { value: string } | undefined;
-  if (row) return row.value;
+export async function getSetting(key: string): Promise<string | null> {
+  const r = await row<{ value: string }>("settings", { key });
+  if (r) return r.value;
   const fallback = ENV_FALLBACK[key];
   if (fallback) {
     const v = fallback();
     return v && v.length ? v : null;
   }
+  // Generic env fallback: TIMEZONE, CHECK_INTERVAL_MINUTES, KAGGLE_POLL_MINUTES, …
+  const envV = process.env[key.toUpperCase()];
+  if (envV && envV.length) return envV;
   return null;
 }
 
-export function setSetting(key: string, value: string): void {
-  db.prepare(
-    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-  ).run(key, value);
+export async function setSetting(key: string, value: string): Promise<void> {
+  await upsertRows("settings", [{ key, value }], "key");
 }
 
-export function getAllSettings(): SettingsMap {
-  const rows = db.prepare("SELECT key, value FROM settings").all() as {
-    key: string;
-    value: string;
-  }[];
+export async function getAllSettings(): Promise<SettingsMap> {
+  const rowsArr = await rows<{ key: string; value: string }>("settings");
   const map: SettingsMap = { ...SETTING_DEFAULTS };
-  for (const r of rows) map[r.key] = r.value;
+  for (const r of rowsArr) map[r.key] = r.value;
   return map;
 }
 
-export function timezone(): string {
-  return getSetting("timezone") || SETTING_DEFAULTS.timezone;
+export async function timezone(): Promise<string> {
+  return (await getSetting("timezone")) || SETTING_DEFAULTS.timezone;
 }
 
-export function updateSettings(patch: Record<string, string>): void {
+export async function updateSettings(patch: Record<string, string>): Promise<void> {
   for (const [k, v] of Object.entries(patch)) {
     if (!(k in SETTING_DEFAULTS)) continue;
-    setSetting(k, v);
+    await setSetting(k, v);
   }
 }

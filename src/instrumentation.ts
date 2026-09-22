@@ -5,6 +5,8 @@ export async function register() {
   if (process.env.NEXT_RUNTIME === "nodejs" && process.env.NEXT_PHASE !== "phase-production-build" && !g.__tamSchedulerStarted) {
     g.__tamSchedulerStarted = true;
     const { startScheduler } = await import("./lib/scheduler");
-    startScheduler();
+    await startScheduler().catch(() => {
+      /* scheduler startup must never crash lambda init */
+    });
   }
 }

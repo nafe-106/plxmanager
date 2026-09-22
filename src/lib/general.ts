@@ -1,9 +1,9 @@
 import crypto from "node:crypto";
-import { db, nowSql } from "./db";
+import { byId, rows, row, insertRow, insertMany, updateRow, upsertRows, nowSql } from "./store";
 import { decrypt, encrypt } from "./crypto";
 import { getProvider, PROVIDERS } from "./providers";
 import { timezone, getSetting } from "./settings";
-import { tzParts, dayKeyFromParts, logUsage, periodTokensUsed } from "./usage";
+import { dayKeyFromParts, tzParts, logUsage, periodTokensUsed } from "./usage";
 import type { ApiKeyRow } from "./keys";
 
 // ----- General (round-robin) keys ------------------------------------------
@@ -37,45 +37,47 @@ function hashSecret(secret: string): string {
   return crypto.createHash("sha256").update(secret).digest("hex");
 }
 
-export function createGeneralKey(name: string, note = ""): { id: number; secret: string } {
+export async function createGeneralKey(name: string, note = ""): Promise<{ id: number; secret: string }> {
   const secret = generateSecret();
-  const info = db
-    .prepare("INSERT INTO general_keys(name, note, key_hash, secret_enc) VALUES(?, ?, ?, ?)")
-    .run(String(name).slice(0, 200) || "general key", String(note).slice(0, 500), hashSecret(secret), encrypt(secret));
-  return { id: Number(info.lastInsertRowid), secret };
+  const inserted = await insertRow<GeneralKeyRow>("general_keys", {
+    name: String(name).slice(0, 200) || "general key",
+    note: String(note).slice(0, 500),
+    key_hash: hashSecret(secret),
+    secret_enc: encrypt(secret),
+  });
+  return { id: Number(inserted.id), secret };
 }
 
 // Reveal the stored secret (encrypted at rest). Returns null for legacy keys
 // created before secret_enc existed — those must be regenerated.
-export function revealGeneralKeySecret(gkId: number): string | null {
-  const row = db.prepare("SELECT secret_enc FROM general_keys WHERE id = ?").get(gkId) as
-    | { secret_enc: string | null }
-    | undefined;
-  if (!row?.secret_enc) return null;
-  return decrypt(row.secret_enc) || null;
+export async function revealGeneralKeySecret(gkId: number): Promise<string | null> {
+  const rowData = await byId<{ secret_enc: string | null }>("general_keys", gkId);
+  if (!rowData?.secret_enc) return null;
+  return decrypt(rowData.secret_enc) || null;
 }
 
 // Issue a fresh secret for an existing key, keeping usage stats and name.
-export function rotateGeneralKeySecret(gkId: number): string | null {
-  const row = db.prepare("SELECT id FROM general_keys WHERE id = ?").get(gkId) as { id: number } | undefined;
-  if (!row) return null;
+export async function rotateGeneralKeySecret(gkId: number): Promise<string | null> {
+  const exists = await byId<{ id: number }>("general_keys", gkId);
+  if (!exists) return null;
   const secret = generateSecret();
-  db.prepare("UPDATE general_keys SET key_hash = ?, secret_enc = ? WHERE id = ?").run(hashSecret(secret), encrypt(secret), gkId);
+  await updateRow("general_keys", gkId, {
+    key_hash: hashSecret(secret),
+    secret_enc: encrypt(secret),
+  });
   return secret;
 }
 
-export function resolveGeneralKey(bearerHeader: string | null): GeneralKeyRow | null {
+export async function resolveGeneralKey(bearerHeader: string | null): Promise<GeneralKeyRow | null> {
   const secret = (bearerHeader || "").replace(/^Bearer\s+/i, "").trim();
   if (!secret.startsWith(GK_PREFIX) || secret.length < GK_PREFIX.length + 16) return null;
-  const row = db
-    .prepare("SELECT * FROM general_keys WHERE key_hash = ? AND enabled = 1")
-    .get(hashSecret(secret)) as GeneralKeyRow | undefined;
-  return row ?? null;
+  const rowsArr = await rows<GeneralKeyRow>("general_keys", { key_hash: hashSecret(secret), enabled: 1 });
+  return rowsArr[0] ?? null;
 }
 
 // x-api-key / "?key=" fallbacks — some OpenAI-compatible clients send these.
-export function resolveGeneralKeyFromRequest(req: Request): GeneralKeyRow | null {
-  const auth = resolveGeneralKey(req.headers.get("authorization"));
+export async function resolveGeneralKeyFromRequest(req: Request): Promise<GeneralKeyRow | null> {
+  const auth = await resolveGeneralKey(req.headers.get("authorization"));
   if (auth) return auth;
   const xKey = req.headers.get("x-api-key");
   if (xKey) return resolveGeneralKey(`Bearer ${xKey.trim()}`);
@@ -88,31 +90,30 @@ export function resolveGeneralKeyFromRequest(req: Request): GeneralKeyRow | null
 
 // Does this key serve the requested model? Keys with no model rows serve
 // everything; otherwise the model must have an enabled row.
-function servesModel(keyId: number, model: string): boolean {
-  const rows = db
-    .prepare("SELECT id, enabled FROM key_models WHERE key_id = ? AND model = ?")
-    .all(keyId, model) as { id: number; enabled: number }[];
-  if (rows.length) return rows.some((r) => r.enabled === 1);
+async function servesModel(keyId: number, model: string): Promise<boolean> {
+  const rowsArr = await rows<{ id: number; enabled: number }>("key_models", { key_id: keyId, model });
+  if (rowsArr.length) return rowsArr.some((r) => r.enabled === 1);
   // No explicit row for this model: allowed unless the key tracks models at all.
-  const any = db.prepare("SELECT 1 FROM key_models WHERE key_id = ? LIMIT 1").get(keyId);
+  const any = await row<{ id: number }>("key_models", { key_id: keyId });
   return !any;
 }
 
 // Per-model daily request cap from key_models (rpd), if configured.
-function modelRpdLeft(keyId: number, model: string, zone: string): number | null {
-  const m = db
-    .prepare("SELECT rpd, token_limit, period FROM key_models WHERE key_id = ? AND model = ? AND enabled = 1")
-    .get(keyId, model) as { rpd: number; token_limit: number; period: string } | undefined;
+async function modelRpdLeft(keyId: number, model: string, zone: string): Promise<number | null> {
+  const m = await row<{ rpd: number; token_limit: number; period: string }>("key_models", {
+    key_id: keyId,
+    model,
+    enabled: 1,
+  });
   if (!m) return null;
   if (m.rpd > 0) {
     const day = dayKeyFromParts(tzParts(zone));
-    const r = db
-      .prepare("SELECT COALESCE(SUM(hits),0) h FROM key_usage_hourly WHERE key_id = ? AND model = ? AND day = ?")
-      .get(keyId, model, day) as { h: number };
-    if (r.h >= m.rpd) return 0;
+    const hits = await rows<{ hits: number }>("key_usage_hourly", { key_id: keyId, model, day });
+    const h = hits.reduce((s, r) => s + (r.hits ?? 0), 0);
+    if (h >= m.rpd) return 0;
   }
   if (m.token_limit > 0) {
-    const used = periodTokensUsed(keyId, m.period, zone, model);
+    const used = await periodTokensUsed(keyId, m.period, zone, model);
     if (used >= m.token_limit) return 0;
   }
   return 1;
@@ -129,23 +130,23 @@ export interface PickedKey {
 // (used/limit); among near-equal utilization rotate cyclically so traffic
 // spreads evenly instead of hammering one key. `candidates` (optional) is a
 // pre-filtered eligible set (e.g. keys whose catalog serves the model).
-export function pickProviderKey(gkId: number, model?: string, candidates?: ApiKeyRow[]): PickedKey | null {
-  const rows = candidates ?? (db
-    .prepare("SELECT * FROM api_keys WHERE disabled = 0 AND status != 'dead' ORDER BY id")
-    .all() as ApiKeyRow[]);
-  if (!rows.length) return null;
+export async function pickProviderKey(gkId: number, model?: string, candidates?: ApiKeyRow[]): Promise<PickedKey | null> {
+  const rowsArr =
+    candidates ??
+    (await rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" }));
+  if (!rowsArr.length) return null;
 
-  const zone = timezone();
+  const zone = await timezone();
   const softCap = 1_000_000; // for keys without a configured limit
 
   const scored: PickedKey[] = [];
-  for (const r of rows) {
-    if (model && !servesModel(r.id, model)) continue;
-    const used = r.provider_usage !== null ? r.provider_usage : periodTokensUsed(r.id, r.usage_period, zone);
+  for (const r of rowsArr) {
+    if (model && !(await servesModel(r.id, model))) continue;
+    const used = r.provider_usage !== null ? r.provider_usage : await periodTokensUsed(r.id, r.usage_period, zone);
     const limit = r.provider_limit ?? r.usage_limit ?? 0;
     if (limit > 0 && used >= limit) continue; // exhausted for the period
     if (model) {
-      const left = modelRpdLeft(r.id, model, zone);
+      const left = await modelRpdLeft(r.id, model, zone);
       if (left === 0) continue;
     }
     const ratio = limit > 0 ? used / limit : used / softCap;
@@ -158,51 +159,60 @@ export function pickProviderKey(gkId: number, model?: string, candidates?: ApiKe
   const group = scored.filter((s) => s.ratio <= min + 0.01); // near-ties rotate
 
   const cursorKey = `gk_rr_${gkId}`;
-  const cursor = Number(getSetting(cursorKey) || 0);
+  const cursor = Number((await getSetting(cursorKey)) || 0);
   const idx = group.findIndex((s) => s.row.id === cursor);
   const chosen = group[(idx + 1) % group.length];
-  setRrCursor(cursorKey, chosen.row.id);
+  await setRrCursor(cursorKey, chosen.row.id);
   return chosen;
 }
 
-function setRrCursor(key: string, keyId: number): void {
-  db.prepare(
-    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
-  ).run(key, String(keyId));
+async function setRrCursor(key: string, keyId: number): Promise<void> {
+  await upsertRows("settings", [{ key, value: String(keyId) }], "key");
 }
 
 // ----- Usage logging for proxied requests -----------------------------------
 
-export function logProxyUsage(gkId: number, keyId: number | null, tokens: number, model: string): void {
-  const zone = timezone();
-  if (keyId !== null && keyId !== undefined) logUsage(keyId, tokens, true, zone, model);
+export async function logProxyUsage(gkId: number, keyId: number | null, tokens: number, model: string): Promise<void> {
+  const zone = await timezone();
+  if (keyId !== null && keyId !== undefined) await logUsage(keyId, tokens, true, zone, model);
 
   const p = tzParts(zone);
   const day = dayKeyFromParts(p);
-  db.prepare(
-    `INSERT INTO general_key_logs(gk_id, key_id, hits, tokens, day, hour)
-     VALUES(?, ?, 1, ?, ?, ?)`
-  ).run(gkId, keyId ?? null, tokens, day, p.hour);
-  db.prepare("UPDATE general_keys SET last_used_at = ? WHERE id = ?").run(nowSql(), gkId);
+  await insertRow("general_key_logs", {
+    gk_id: gkId,
+    key_id: keyId ?? null,
+    hits: 1,
+    tokens,
+    day,
+    hour: p.hour,
+  });
+  await updateRow("general_keys", gkId, { last_used_at: nowSql() });
 }
 
-export function generalKeyStats(gkId: number, zone?: string) {
-  const z = zone ?? timezone();
+export async function generalKeyStats(gkId: number, zone?: string) {
+  const z = zone ?? (await timezone());
   const today = dayKeyFromParts(tzParts(z));
-  const all = db
-    .prepare("SELECT COALESCE(SUM(hits),0) hits, COALESCE(SUM(tokens),0) tokens FROM general_key_logs WHERE gk_id = ?")
-    .get(gkId) as { hits: number; tokens: number };
-  const day = db
-    .prepare("SELECT COALESCE(SUM(hits),0) hits, COALESCE(SUM(tokens),0) tokens FROM general_key_logs WHERE gk_id = ? AND day = ?")
-    .get(gkId, today) as { hits: number; tokens: number };
-  const perKey = db
-    .prepare(
-      `SELECT key_id, COALESCE(SUM(hits),0) hits, COALESCE(SUM(tokens),0) tokens
-       FROM general_key_logs WHERE gk_id = ? AND key_id IS NOT NULL
-       GROUP BY key_id ORDER BY hits DESC`
-    )
-    .all(gkId) as { key_id: number; hits: number; tokens: number }[];
-  return { hitsAll: all.hits, tokensAll: all.tokens, hitsToday: day.hits, tokensToday: day.tokens, perKey };
+  const all = await rows<{ hits: number; tokens: number; day: string; key_id: number | null; hour: number }>("general_key_logs", { gk_id: gkId });
+  const hitsAll = all.reduce((s, r) => s + (r.hits ?? 0), 0);
+  const tokensAll = all.reduce((s, r) => s + (r.tokens ?? 0), 0);
+  const day = all.filter((r) => r.day === today);
+  const hitsToday = day.reduce((s, r) => s + (r.hits ?? 0), 0);
+  const tokensToday = day.reduce((s, r) => s + (r.tokens ?? 0), 0);
+  const perKey = new Map<number, { hits: number; tokens: number }>();
+  for (const r of all) {
+    if (r.key_id === null || r.key_id === undefined) continue;
+    const e = perKey.get(r.key_id) ?? { hits: 0, tokens: 0 };
+    e.hits += r.hits ?? 0;
+    e.tokens += r.tokens ?? 0;
+    perKey.set(r.key_id, e);
+  }
+  return {
+    hitsAll,
+    tokensAll,
+    hitsToday,
+    tokensToday,
+    perKey: [...perKey.entries()].map(([key_id, v]) => ({ key_id, ...v })).sort((a, b) => b.hits - a.hits),
+  };
 }
 
 // ----- OpenAI-compatible proxy helpers --------------------------------------
@@ -328,16 +338,16 @@ const catalogCache = new Map<number, CatalogEntry>(); // key: api_keys.id
 
 // Fetch a single key's OpenAI-style model list from its provider.
 async function fetchKeyModels(keyId: number): Promise<CatalogEntry | null> {
-  const row = db.prepare("SELECT * FROM api_keys WHERE id = ?").get(keyId) as ApiKeyRow | undefined;
-  if (!row) return null;
-  const def = getProvider(row.provider);
+  const rowData = await byId<ApiKeyRow>("api_keys", keyId);
+  if (!rowData) return null;
+  const def = getProvider(rowData.provider);
   const modelsPath = def.modelsPath || def.checkPath;
-  const base = (row.base_url || def.defaultBaseUrl || "").replace(/\/+$/, "");
+  const base = (rowData.base_url || def.defaultBaseUrl || "").replace(/\/+$/, "");
   if (!base || !modelsPath) return null;
 
   let plain = "";
   try {
-    plain = decrypt(row.api_key_enc);
+    plain = decrypt(rowData.api_key_enc);
   } catch {
     return null;
   }
@@ -349,7 +359,7 @@ async function fetchKeyModels(keyId: number): Promise<CatalogEntry | null> {
   }
   try {
     const res = await fetch(url, {
-      headers: { ...upstreamHeaders(row.provider, plain, 0), Accept: "application/json" },
+      headers: { ...upstreamHeaders(rowData.provider, plain, 0), Accept: "application/json" },
       signal: AbortSignal.timeout(15_000),
       redirect: "follow",
     });
@@ -382,14 +392,12 @@ async function keyModels(keyId: number): Promise<{ id: string; owned_by?: string
     return cached.models;
   }
   const fresh = await fetchKeyModels(keyId);
-  const dbRows = db
-    .prepare("SELECT model AS id FROM key_models WHERE key_id = ? AND enabled = 1")
-    .all(keyId) as { id: string }[];
+  const dbRows = await rows<{ id: string }>("key_models", { key_id: keyId, enabled: 1 });
   const base = fresh ? fresh.models : cached?.models ?? [];
   const merged = new Map<string, { id: string; owned_by?: string; context_length?: number }>();
   for (const m of base) merged.set(m.id, m);
   for (const r of dbRows) {
-    if (!merged.has(r.id)) merged.set(r.id, r);
+    if (r.id !== undefined && !merged.has(r.id)) merged.set(r.id, r);
   }
   const arr = [...merged.values()];
   catalogCache.set(keyId, { models: arr, fetchedAt: fresh?.fetchedAt ?? Date.now() });
@@ -400,11 +408,9 @@ async function keyModels(keyId: number): Promise<{ id: string; owned_by?: string
 // Models are exposed PER PROVIDER ("groq/openai/gpt-oss-120b"), never merged:
 // the same upstream model from two providers stays two selectable models.
 export async function mergedModelCatalog(): Promise<GatewayModel[]> {
-  const rows = db
-    .prepare("SELECT * FROM api_keys WHERE disabled = 0 AND status != 'dead' ORDER BY id")
-    .all() as ApiKeyRow[];
+  const rowsArr = await rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" });
   const out = new Map<string, GatewayModel>();
-  for (const r of rows) {
+  for (const r of rowsArr) {
     const def = getProvider(r.provider);
     // Live provider list first; DB rows are only a fallback when the provider
     // is unreachable (keyModels already implements that policy).
@@ -435,10 +441,8 @@ export async function modelsForRequest(
   model: string | undefined,
   opts: { allKeys?: boolean } = {}
 ): Promise<{ entry: { id: string; owned_by?: string; context_length?: number } | null; keys: ApiKeyRow[]; catalog: Map<string, { id: string; owned_by?: string; context_length?: number }> }> {
-  const zone = timezone();
-  const rows = db
-    .prepare("SELECT * FROM api_keys WHERE disabled = 0 AND status != 'dead' ORDER BY id")
-    .all() as ApiKeyRow[];
+  const zone = await timezone();
+  const rowsArr = await rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" });
 
   const wantAll = !!opts.allKeys || !model;
   // "groq/openai/gpt-oss-120b" → provider "groq", upstream "openai/gpt-oss-120b".
@@ -446,7 +450,7 @@ export async function modelsForRequest(
   const catalog = new Map<string, GatewayModel>();
   const eligible: ApiKeyRow[] = [];
 
-  for (const r of rows) {
+  for (const r of rowsArr) {
     const list = await keyModels(r.id);
     for (const m of list) {
       const id = `${getProvider(r.provider).id}/${m.id}`;
@@ -459,10 +463,14 @@ export async function modelsForRequest(
       // No effective rows → provider doesn't track models; assume yes.
       const tracksModels = list.length > 0;
       const serves = split?.provider ? getProvider(r.provider).id === split.provider && (inCatalog || !tracksModels) : inCatalog || !tracksModels;
-      if (serves && keyEligible(r, split?.upstream, zone)) eligible.push(r);
+      if (serves && (await keyEligible(r, split?.upstream, zone))) eligible.push(r);
     }
   }
-  if (wantAll) eligible.push(...rows.filter((r) => keyEligible(r, undefined, zone)));
+  if (wantAll) {
+    for (const r of rowsArr) {
+      if (await keyEligible(r, undefined, zone)) eligible.push(r);
+    }
+  }
 
   const entry = split
     ? catalog.get(`${split.provider ?? ""}/${split.upstream}`) ?? null
@@ -471,11 +479,11 @@ export async function modelsForRequest(
 }
 
 // Static eligibility (no network): disabled/dead/exhausted/per-model caps.
-function keyEligible(r: ApiKeyRow, model: string | undefined, zone: string): boolean {
-  const used = r.provider_usage !== null ? r.provider_usage : periodTokensUsed(r.id, r.usage_period, zone);
+async function keyEligible(r: ApiKeyRow, model: string | undefined, zone: string): Promise<boolean> {
+  const used = r.provider_usage !== null ? r.provider_usage : await periodTokensUsed(r.id, r.usage_period, zone);
   const limit = r.provider_limit ?? r.usage_limit ?? 0;
   if (limit > 0 && used >= limit) return false;
-  if (model && modelRpdLeft(r.id, model, zone) === 0) return false;
+  if (model && (await modelRpdLeft(r.id, model, zone)) === 0) return false;
   return true;
 }
 

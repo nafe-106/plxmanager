@@ -1,197 +1,149 @@
-import { db } from "./db";
+import {
+  rows,
+  row,
+  deleteRows,
+  upsertRows,
+  addDays,
+  dayKey,
+  dayKeyFromParts,
+  monthStartKey,
+  tzParts,
+  weekStartKey,
+  type Where,
+  type TzParts,
+} from "./store";
 import { getSetting, timezone } from "./settings";
 
-export interface TzParts {
-  year: number;
-  month: number;
-  day: number;
+export { tzParts, dayKey, dayKeyFromParts, monthStartKey, weekStartKey, addDays, type TzParts };
+
+type HourlyRow = {
+  key_id: number;
+  model: string;
+  day: string;
   hour: number;
-  minute: number;
-  second: number;
-  weekday: number;
-}
+  hits: number;
+  tokens: number;
+};
 
-// Local-wall-clock parts in a given IANA timezone.
-export function tzParts(tz: string, d: Date = new Date()): TzParts {
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23",
-  });
-  const parts: Record<string, string> = {};
-  for (const p of fmt.formatToParts(d)) if (p.type !== "literal") parts[p.type] = p.value;
-  const year = +parts.year;
-  const month = +parts.month;
-  const day = +parts.day;
-  const weekday = new Date(Date.UTC(year, month - 1, day)).getUTCDay();
-  return {
-    year,
-    month,
-    day,
-    hour: +parts.hour,
-    minute: +parts.minute,
-    second: +parts.second,
-    weekday,
-  };
-}
-
-export function dayKeyFromParts(p: TzParts): string {
-  return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
-}
-
-export function dayKey(tz: string, d: Date = new Date()): string {
-  return dayKeyFromParts(tzParts(tz, d));
-}
-
-export function monthStartKey(tz: string, d: Date = new Date()): string {
-  const p = tzParts(tz, d);
-  return `${p.year}-${String(p.month).padStart(2, "0")}-01`;
-}
-
-function addDays(day: string, n: number): string {
-  const [y, m, d] = day.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d + n));
-  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
-}
-
-// Most recent local date whose weekday == resetDay (0=Sun .. 6=Sat).
-export function weekStartKey(tz: string, resetDay: number, d: Date = new Date()): string {
-  let key = dayKey(tz, d);
-  let parts = tzParts(tz, d);
-  while (parts.weekday !== resetDay) {
-    key = addDays(key, -1);
-    parts = tzParts(tz, new Date(Date.UTC(parts.year, parts.month - 1, parts.day + 1)));
-    // recompute parts from the key directly to avoid drift
-    parts = tzPartsOfString(key);
-  }
-  return key;
-}
-
-function tzPartsOfString(day: string): TzParts {
-  const [y, m, d] = day.split("-").map(Number);
-  return {
-    year: y,
-    month: m,
-    day: d,
-    hour: 0,
-    minute: 0,
-    second: 0,
-    weekday: new Date(Date.UTC(y, m - 1, d)).getUTCDay(),
-  };
-}
-
-export function usageWeekResetDay(): number {
-  return Math.max(0, Math.min(6, parseInt(getSetting("usage_week_reset_day") || "0", 10) || 0));
+export async function usageWeekResetDay(): Promise<number> {
+  return Math.max(0, Math.min(6, parseInt((await getSetting("usage_week_reset_day")) || "0", 10) || 0));
 }
 
 // ----- Logging -------------------------------------------------------------
-export function logUsage(
+export async function logUsage(
   keyId: number,
   tokens: number,
   success: boolean,
   tz?: string,
   model?: string
-): void {
-  const zone = tz ?? timezone();
+): Promise<void> {
+  const zone = tz ?? (await timezone());
   const p = tzParts(zone);
   const day = dayKeyFromParts(p);
   const tok = success ? tokens : 0;
-  db.prepare(
-    `INSERT INTO key_usage_hourly(key_id, model, day, hour, hits, tokens)
-     VALUES(?, ?, ?, ?, 1, ?)
-     ON CONFLICT(key_id, model, day, hour) DO UPDATE SET
-       hits = hits + 1,
-       tokens = tokens + excluded.tokens`
-  ).run(keyId, model ?? "", day, p.hour, tok);
+  const prev = (await row<HourlyRow>("key_usage_hourly", {
+    key_id: keyId,
+    model: model ?? "",
+    day,
+    hour: p.hour,
+  })) as HourlyRow | null;
+  await upsertRows(
+    "key_usage_hourly",
+    [
+      {
+        key_id: keyId,
+        model: model ?? "",
+        day,
+        hour: p.hour,
+        hits: (prev?.hits ?? 0) + 1,
+        tokens: (prev?.tokens ?? 0) + tok,
+      },
+    ],
+    "key_id,model,day,hour"
+  );
 }
 
-function modelFilter(keyId: number, model?: string): { sql: string; args: unknown[] } {
-  if (model !== undefined) return { sql: "key_id = ? AND model = ?", args: [keyId, model ?? ""] };
-  return { sql: "key_id = ?", args: [keyId] };
+function hourFilters(keyId: number, model?: string): Where {
+  const f: Where = { key_id: keyId };
+  if (model !== undefined) f.model = model || "";
+  return f;
 }
 
 // ----- Aggregation ---------------------------------------------------------
-export function usageSummary(keyId: number, tz?: string, model?: string) {
-  const zone = tz ?? timezone();
+export async function usageSummary(keyId: number, tz?: string, model?: string) {
+  const zone = tz ?? (await timezone());
   const today = dayKey(zone);
-  const wkStart = weekStartKey(zone, usageWeekResetDay());
+  const wkStart = weekStartKey(zone, await usageWeekResetDay());
   const monthStart = monthStartKey(zone);
-  const mf = modelFilter(keyId, model);
+  const mf = hourFilters(keyId, model);
 
-  const all = db
-    .prepare(`SELECT COALESCE(SUM(hits),0) hits, COALESCE(SUM(tokens),0) tokens FROM key_usage_hourly WHERE ${mf.sql}`)
-    .get(...mf.args) as { hits: number; tokens: number };
-
-  const daily = db
-    .prepare(`SELECT COALESCE(SUM(hits),0) hits, COALESCE(SUM(tokens),0) tokens FROM key_usage_hourly WHERE ${mf.sql} AND day = ?`)
-    .get(...mf.args, today) as { hits: number; tokens: number };
-
-  const weekly = db
-    .prepare(`SELECT COALESCE(SUM(hits),0) hits FROM key_usage_hourly WHERE ${mf.sql} AND day >= ?`)
-    .get(...mf.args, wkStart) as { hits: number };
-
-  const monthly = db
-    .prepare(`SELECT COALESCE(SUM(tokens),0) tokens FROM key_usage_hourly WHERE ${mf.sql} AND day >= ?`)
-    .get(...mf.args, monthStart) as { tokens: number };
-
-  const busy = db
-    .prepare(`SELECT hour, SUM(hits) h FROM key_usage_hourly WHERE ${mf.sql} GROUP BY hour ORDER BY h DESC, hour ASC LIMIT 1`)
-    .get(...mf.args) as { hour: number; h: number } | undefined;
+  const all = await rows<HourlyRow>("key_usage_hourly", mf);
+  let hitsAll = 0;
+  let tokensAll = 0;
+  let hitsToday = 0;
+  let tokensToday = 0;
+  let hitsWeek = 0;
+  let tokensMonth = 0;
+  const byHour = new Map<number, number>();
+  for (const r of all) {
+    hitsAll += r.hits ?? 0;
+    tokensAll += r.tokens ?? 0;
+    if (r.day === today) {
+      hitsToday += r.hits ?? 0;
+      tokensToday += r.tokens ?? 0;
+    }
+    if (r.day >= wkStart) hitsWeek += r.hits ?? 0;
+    if (r.day >= monthStart) tokensMonth += r.tokens ?? 0;
+    byHour.set(r.hour, (byHour.get(r.hour) ?? 0) + (r.hits ?? 0));
+  }
+  let busyHour: number | null = null;
+  let busyHits = 0;
+  for (const [h, n] of byHour) {
+    if (n > busyHits) {
+      busyHits = n;
+      busyHour = h;
+    }
+  }
 
   return {
-    hitsToday: daily.hits,
-    tokensToday: daily.tokens,
-    hitsWeek: weekly.hits,
-    hitsAll: all.hits,
-    tokensAll: all.tokens,
-    tokensMonth: monthly.tokens,
-    busyHour: busy ? busy.hour : null,
-    busyHits: busy ? busy.h : 0,
+    hitsToday,
+    tokensToday,
+    hitsWeek,
+    hitsAll,
+    tokensAll,
+    tokensMonth,
+    busyHour,
+    busyHits,
   };
 }
 
 // Tokens "used" for the key's configured period (daily/monthly/total).
-export function periodTokensUsed(keyId: number, period: string, tz?: string, model?: string): number {
-  const zone = tz ?? timezone();
-  const mf = modelFilter(keyId, model);
+export async function periodTokensUsed(keyId: number, period: string, tz?: string, model?: string): Promise<number> {
+  const zone = tz ?? (await timezone());
+  const mf = hourFilters(keyId, model);
+  const all = await rows<HourlyRow>("key_usage_hourly", mf);
   if (period === "daily") {
-    const r = db
-      .prepare(`SELECT COALESCE(SUM(tokens),0) t FROM key_usage_hourly WHERE ${mf.sql} AND day = ?`)
-      .get(...mf.args, dayKey(zone)) as { t: number };
-    return r.t;
+    const day = dayKey(zone);
+    return all.filter((r) => r.day === day).reduce((s, r) => s + (r.tokens ?? 0), 0);
   }
   if (period === "monthly") {
-    const r = db
-      .prepare(`SELECT COALESCE(SUM(tokens),0) t FROM key_usage_hourly WHERE ${mf.sql} AND day >= ?`)
-      .get(...mf.args, monthStartKey(zone)) as { t: number };
-    return r.t;
+    const start = monthStartKey(zone);
+    return all.filter((r) => r.day >= start).reduce((s, r) => s + (r.tokens ?? 0), 0);
   }
-  const r = db
-    .prepare(`SELECT COALESCE(SUM(tokens),0) t FROM key_usage_hourly WHERE ${mf.sql}`)
-    .get(...mf.args) as { t: number };
-  return r.t;
+  return all.reduce((s, r) => s + (r.tokens ?? 0), 0);
 }
 
 // 24 hourly buckets (hits), in local time.
-export function usageHours(keyId: number, model?: string): number[] {
-  const mf = modelFilter(keyId, model);
-  const rows = db
-    .prepare(`SELECT hour, SUM(hits) h FROM key_usage_hourly WHERE ${mf.sql} GROUP BY hour`)
-    .all(...mf.args) as { hour: number; h: number }[];
+export async function usageHours(keyId: number, model?: string): Promise<number[]> {
+  const mf = hourFilters(keyId, model);
+  const all = await rows<HourlyRow>("key_usage_hourly", mf);
   const out = new Array(24).fill(0);
-  for (const r of rows) if (r.hour >= 0 && r.hour < 24) out[r.hour] = r.h;
+  for (const r of all) if (r.hour >= 0 && r.hour < 24) out[r.hour] += r.hits ?? 0;
   return out;
 }
 
-export function resetUsage(keyId: number, model?: string): number {
-  const mf = modelFilter(keyId, model);
-  const info = db.prepare(`DELETE FROM key_usage_hourly WHERE ${mf.sql}`).run(...mf.args);
-  return info.changes;
+export async function resetUsage(keyId: number, model?: string): Promise<void> {
+  await deleteRows("key_usage_hourly", hourFilters(keyId, model));
 }
 
 export interface WeekBucket {
@@ -200,9 +152,9 @@ export interface WeekBucket {
   hits: number;
 }
 
-export function usageWeeklyHistory(keyId: number, n = 8): WeekBucket[] {
-  const zone = timezone();
-  const resetDay = usageWeekResetDay();
+export async function usageWeeklyHistory(keyId: number, n = 8): Promise<WeekBucket[]> {
+  const zone = await timezone();
+  const resetDay = await usageWeekResetDay();
   const start = weekStartKey(zone, resetDay);
   const starts: string[] = [];
   let cur = start;
@@ -211,72 +163,39 @@ export function usageWeeklyHistory(keyId: number, n = 8): WeekBucket[] {
     cur = addDays(cur, -7);
     starts.push(cur);
   }
+  const all = await rows<HourlyRow>("key_usage_hourly", { key_id: keyId });
   return starts
     .map((weekStart) => {
       const next = addDays(weekStart, 7);
-      const r = db
-        .prepare(`SELECT COALESCE(SUM(tokens),0) tokens, COALESCE(SUM(hits),0) hits FROM key_usage_hourly WHERE key_id = ? AND day >= ? AND day < ?`)
-        .get(keyId, weekStart, next) as { tokens: number; hits: number };
-      return { weekStart, tokens: r.tokens, hits: r.hits };
+      const inWeek = all.filter((r) => r.day >= weekStart && r.day < next);
+      return {
+        weekStart,
+        tokens: inWeek.reduce((s, r) => s + (r.tokens ?? 0), 0),
+        hits: inWeek.reduce((s, r) => s + (r.hits ?? 0), 0),
+      };
     })
     .reverse();
 }
 
-export function pruneUsageHistory(beforeDays: number): void {
-  const zone = timezone();
+export async function pruneUsageHistory(beforeDays: number): Promise<void> {
+  const zone = await timezone();
   const p = tzParts(zone);
   const cutoff = new Date(Date.UTC(p.year, p.month - 1, p.day - beforeDays));
   const cutoffKey = `${cutoff.getUTCFullYear()}-${String(cutoff.getUTCMonth() + 1).padStart(2, "0")}-${String(cutoff.getUTCDate()).padStart(2, "0")}`;
-  db.prepare(`DELETE FROM key_usage_hourly WHERE day < ?`).run(cutoffKey);
+  await deleteRows("key_usage_hourly", { day: { lt: cutoffKey } });
 }
 
-// Per-model usage for a key, joined with each model's configured limits.
-export function modelUsageList(keyId: number, tz?: string): ModelUsage[] {
-  const zone = tz ?? timezone();
-  const models = db
-    .prepare("SELECT * FROM key_models WHERE key_id = ? ORDER BY id")
-    .all(keyId) as {
-    id: number;
-    key_id: number;
-    model: string;
-    token_limit: number;
-    period: string;
-    usage_hour: number;
-    rpm: number;
-    rpd: number;
-    tpm: number;
-    enabled: number;
-  }[];
-
-  return models.map((m) => {
-    const s = usageSummary(keyId, zone, m.model);
-    const used = periodTokensUsed(keyId, m.period, zone, m.model);
-    const todayTokens = s.tokensToday;
-    const limit = m.token_limit || 0;
-    const pct = limit > 0 ? Math.min(100, (todayTokens / limit) * 100) : 0;
-    const reqPct = m.rpd > 0 ? Math.min(100, (s.hitsToday / m.rpd) * 100) : m.rpd === 0 ? 0 : 100;
-    return {
-      id: m.id,
-      keyId,
-      model: m.model,
-      tokenLimit: m.token_limit,
-      period: m.period,
-      usage_hour: m.usage_hour,
-      rpm: m.rpm,
-      rpd: m.rpd,
-      tpm: m.tpm,
-      enabled: m.enabled,
-      used,
-      tokensToday: todayTokens,
-      hitsToday: s.hitsToday,
-      hitsAll: s.hitsAll,
-      busyHour: s.busyHour,
-      pct: Math.round(pct * 10) / 10,
-      limitLeft: Math.max(0, limit - todayTokens),
-      reqPct: reqPct === 100 && m.rpd > 0 && s.hitsToday < m.rpd ? 99.9 : Math.round(reqPct * 10) / 10,
-      reqLeft: Math.max(0, m.rpd - s.hitsToday),
-    };
-  });
+export interface KeyModelRow {
+  id: number;
+  key_id: number;
+  model: string;
+  token_limit: number;
+  period: string;
+  usage_hour: number;
+  rpm: number;
+  rpd: number;
+  tpm: number;
+  enabled: number;
 }
 
 export interface ModelUsage {
@@ -299,4 +218,42 @@ export interface ModelUsage {
   limitLeft: number;
   reqPct: number;
   reqLeft: number;
+}
+
+// Per-model usage for a key, joined with each model's configured limits.
+export async function modelUsageList(keyId: number, tz?: string): Promise<ModelUsage[]> {
+  const zone = tz ?? (await timezone());
+  const models = await rows<KeyModelRow>("key_models", { key_id: keyId }, { order: "id" });
+
+  const out: ModelUsage[] = [];
+  for (const m of models) {
+    const s = await usageSummary(keyId, zone, m.model);
+    const used = await periodTokensUsed(keyId, m.period, zone, m.model);
+    const todayTokens = s.tokensToday;
+    const limit = m.token_limit || 0;
+    const pct = limit > 0 ? Math.min(100, (todayTokens / limit) * 100) : 0;
+    const reqPct = m.rpd > 0 ? Math.min(100, (s.hitsToday / m.rpd) * 100) : m.rpd === 0 ? 0 : 100;
+    out.push({
+      id: m.id,
+      keyId,
+      model: m.model,
+      tokenLimit: m.token_limit,
+      period: m.period,
+      usage_hour: m.usage_hour,
+      rpm: m.rpm,
+      rpd: m.rpd,
+      tpm: m.tpm,
+      enabled: m.enabled,
+      used,
+      tokensToday: todayTokens,
+      hitsToday: s.hitsToday,
+      hitsAll: s.hitsAll,
+      busyHour: s.busyHour,
+      pct: Math.round(pct * 10) / 10,
+      limitLeft: Math.max(0, limit - todayTokens),
+      reqPct: reqPct === 100 && m.rpd > 0 && s.hitsToday < m.rpd ? 99.9 : Math.round(reqPct * 10) / 10,
+      reqLeft: Math.max(0, m.rpd - s.hitsToday),
+    });
+  }
+  return out;
 }

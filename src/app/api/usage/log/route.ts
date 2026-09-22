@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
+import { byId } from "@/lib/store";
 import { logUsage } from "@/lib/usage";
 import { timezone } from "@/lib/settings";
 
@@ -16,7 +16,7 @@ import { timezone } from "@/lib/settings";
  * - success: whether the request succeeded ("false" counts as a hit but no tokens)
  */
 export async function POST(req: Request) {
-  const expected = process.env.USAGE_LOG_BEARER || "tam-usage-log-token";
+  const expected = process.env.USAGE_LOG_BEARER || "tam-cf5b87ee02fc237b09e1756a892f63c84227c5eb05ccbb21";
   const auth = req.headers.get("authorization") || "";
   if (auth !== `Bearer ${expected}`) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
@@ -27,7 +27,7 @@ export async function POST(req: Request) {
   if (!Number.isInteger(keyId) || keyId <= 0) {
     return NextResponse.json({ error: "keyId is required" }, { status: 400 });
   }
-  const key = db.prepare("SELECT id FROM api_keys WHERE id = ?").get(keyId) as { id: number } | undefined;
+  const key = await byId<{ id: number }>("api_keys", keyId);
   if (!key) {
     return NextResponse.json({ error: "key not found" }, { status: 404 });
   }
@@ -35,6 +35,6 @@ export async function POST(req: Request) {
   const tokens = Math.max(0, Number(body.tokens) || 0);
   const success = body.success !== false;
   const model = typeof body.model === "string" && body.model.trim() ? body.model.trim().slice(0, 200) : undefined;
-  logUsage(keyId, tokens, success, timezone(), model);
+  await logUsage(keyId, tokens, success, await timezone(), model);
   return NextResponse.json({ ok: true });
 }

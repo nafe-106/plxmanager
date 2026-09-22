@@ -1,5 +1,5 @@
 import cron, { ScheduledTask } from "node-cron";
-import { db } from "./db";
+import { deleteRows } from "./store";
 import { getSetting, timezone } from "./settings";
 import { checkAllKeys } from "./keys";
 import { watchKaggle, runAutoSwitcher, refreshAllQuotas } from "./kaggle";
@@ -22,7 +22,7 @@ function minutesToCron(minutes: number): string {
   return `0 */${h} * * *`;
 }
 
-function startJob(tag: string, expr: string, fn: () => Promise<void> | void) {
+function startJob(tag: string, expr: string, tz: string, fn: () => Promise<void> | void) {
   const existing = tasks.findIndex((t) => t.tag === tag);
   if (existing >= 0) {
     tasks[existing].job.stop();
@@ -35,32 +35,43 @@ function startJob(tag: string, expr: string, fn: () => Promise<void> | void) {
         /* a failing job must never crash the checker */
       });
     },
-    { noOverlap: true, suppressMissedWarning: true, timezone: timezone() || undefined }
+    { noOverlap: true, suppressMissedWarning: true, timezone: tz || undefined }
   );
   tasks.push({ job, tag });
 }
 
-export function startScheduler(): void {
+async function keysJob(): Promise<void> {
+  await checkAllKeys();
+}
+
+async function kaggleJob(): Promise<void> {
+  await refreshAllQuotas();
+  await watchKaggle();
+  await runAutoSwitcher();
+}
+
+async function cleanupJob(): Promise<void> {
+  await pruneUsageHistory(60);
+  const daysAgo = (n: number) => new Date(Date.now() - n * 86400e3).toISOString();
+  await deleteRows("kaggle_session_events", { at: { lt: daysAgo(90) } });
+  await deleteRows("key_checks", { check_at: { lt: daysAgo(60) } });
+}
+
+export async function startScheduler(): Promise<void> {
   if (globalThis.__tamSchedulerStarted) return;
   globalThis.__tamSchedulerStarted = true;
 
-  const checkMinutes = parseInt(getSetting("check_interval_minutes") || "10", 10) || 10;
-  const pollMinutes = parseInt(getSetting("kaggle_poll_minutes") || "3", 10) || 3;
+  const [checkMinutesRaw, pollMinutesRaw, tz] = await Promise.all([
+    getSetting("check_interval_minutes"),
+    getSetting("kaggle_poll_minutes"),
+    timezone(),
+  ]);
+  const checkMinutes = parseInt(checkMinutesRaw || "10", 10) || 10;
+  const pollMinutes = parseInt(pollMinutesRaw || "3", 10) || 3;
 
-  startJob("keys", minutesToCron(checkMinutes), async () => {
-    await checkAllKeys();
-  });
-  startJob("kaggle", minutesToCron(pollMinutes), async () => {
-    await refreshAllQuotas();
-    await watchKaggle();
-    await runAutoSwitcher();
-  });
-  startJob("cleanup", "30 0 * * *", async () => {
-    pruneUsageHistory(60);
-    db.prepare("DELETE FROM kaggle_session_events WHERE at < datetime('now', '-90 days')").run();
-    db.prepare("DELETE FROM key_checks WHERE check_at < datetime('now', '-60 days')").run();
-    db.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run();
-  });
+  startJob("keys", minutesToCron(checkMinutes), tz, keysJob);
+  startJob("kaggle", minutesToCron(pollMinutes), tz, kaggleJob);
+  startJob("cleanup", "30 0 * * *", tz, cleanupJob);
 
   // Kick off once shortly after boot so the UI shows fresh data immediately.
   setTimeout(() => void checkAllKeys().catch(() => {}), 5000);
@@ -74,16 +85,15 @@ export function startScheduler(): void {
   }, 8000);
 }
 
-export function restartSchedulerJobs(): void {
+export async function restartSchedulerJobs(): Promise<void> {
   if (!globalThis.__tamSchedulerStarted) return startScheduler();
-  const checkMinutes = parseInt(getSetting("check_interval_minutes") || "10", 10) || 10;
-  const pollMinutes = parseInt(getSetting("kaggle_poll_minutes") || "3", 10) || 3;
-  startJob("keys", minutesToCron(checkMinutes), async () => {
-    await checkAllKeys();
-  });
-  startJob("kaggle", minutesToCron(pollMinutes), async () => {
-    await refreshAllQuotas();
-    await watchKaggle();
-    await runAutoSwitcher();
-  });
+  const [checkMinutesRaw, pollMinutesRaw, tz] = await Promise.all([
+    getSetting("check_interval_minutes"),
+    getSetting("kaggle_poll_minutes"),
+    timezone(),
+  ]);
+  const checkMinutes = parseInt(checkMinutesRaw || "10", 10) || 10;
+  const pollMinutes = parseInt(pollMinutesRaw || "3", 10) || 3;
+  startJob("keys", minutesToCron(checkMinutes), tz, keysJob);
+  startJob("kaggle", minutesToCron(pollMinutes), tz, kaggleJob);
 }

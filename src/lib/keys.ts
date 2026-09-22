@@ -1,4 +1,4 @@
-import { db, nowSql } from "./db";
+import { byId, rows, insertRow, insertMany, updateRow, deleteRows, nowSql } from "./store";
 import { decrypt, encrypt } from "./crypto";
 import { healthCheck } from "./providers";
 import { sendAlert } from "./alerts";
@@ -27,7 +27,7 @@ export interface ApiKeyRow {
 }
 
 export async function checkKey(keyId: number): Promise<ApiKeyRow> {
-  const key = db.prepare("SELECT * FROM api_keys WHERE id = ?").get(keyId) as ApiKeyRow;
+  const key = await byId<ApiKeyRow>("api_keys", keyId);
   if (!key) throw new Error("key not found");
 
   const plain = decrypt(key.api_key_enc);
@@ -37,54 +37,44 @@ export async function checkKey(keyId: number): Promise<ApiKeyRow> {
     (result.ratelimit && Object.entries(result.ratelimit).length ? JSON.stringify(result.ratelimit) : "") ||
     key.status_detail;
 
-  db.prepare(
-    `INSERT INTO key_checks(key_id, status, error, response_ms, ratelimit, provider_usage)
-     VALUES(?, ?, ?, ?, ?, ?)`
-  ).run(
-    keyId,
-    result.status,
-    result.error || null,
-    result.responseMs ?? null,
-    result.ratelimit && Object.keys(result.ratelimit).length ? JSON.stringify(result.ratelimit) : null,
-    result.providerUsage !== null ? String(result.providerUsage) : null
-  );
+  await insertRow("key_checks", {
+    key_id: keyId,
+    status: result.status,
+    error: result.error || null,
+    response_ms: result.responseMs ?? null,
+    ratelimit: result.ratelimit && Object.keys(result.ratelimit).length ? JSON.stringify(result.ratelimit) : null,
+    provider_usage: result.providerUsage !== null ? String(result.providerUsage) : null,
+  });
 
-  db.prepare(
-    `UPDATE api_keys SET
-      status = ?, status_detail = ?, last_error = ?, last_checked_at = ?,
-      provider_usage = COALESCE(?, provider_usage),
-      provider_limit = COALESCE(?, provider_limit),
-      updated_at = ?
-      WHERE id = ?`
-  ).run(
-    result.status,
-    statusDetail,
-    result.error || "",
-    nowSql(),
-    result.providerUsage ?? null,
-    result.providerLimit ?? null,
-    nowSql(),
-    keyId
-  );
+  const now = nowSql();
+  await updateRow("api_keys", keyId, {
+    status: result.status,
+    status_detail: statusDetail,
+    last_error: result.error || "",
+    last_checked_at: now,
+    provider_usage: result.providerUsage !== null ? result.providerUsage : key.provider_usage,
+    provider_limit: result.providerLimit !== null ? result.providerLimit : key.provider_limit,
+    updated_at: now,
+  });
 
   // Alert only on a fresh death (previous status was not dead/unknown-missed).
   if (
     result.status === "dead" &&
     key.status !== "dead" &&
-    getSetting("alert_on_key_dead") !== "0"
+    (await getSetting("alert_on_key_dead")) !== "0"
   ) {
     void sendAlert({
       kind: "key_dead",
       title: `API key died — ${key.account_name}`,
-      lines: [`Provider: ${key.provider}`, `Error: ${result.error || "unknown"}`, `Checked at: ${nowSql()}`],
+      lines: [`Provider: ${key.provider}`, `Error: ${result.error || "unknown"}`, `Checked at: ${now}`],
     });
   }
 
-  return db.prepare("SELECT * FROM api_keys WHERE id = ?").get(keyId) as ApiKeyRow;
+  return (await byId<ApiKeyRow>("api_keys", keyId))!;
 }
 
 export async function checkAllKeys(): Promise<{ ok: number; failed: number }> {
-  const keys = db.prepare("SELECT * FROM api_keys WHERE disabled = 0").all() as ApiKeyRow[];
+  const keys = await rows<ApiKeyRow>("api_keys", { disabled: 0 }, { order: "id" });
   let ok = 0;
   let failed = 0;
   for (const k of keys) {
@@ -99,9 +89,9 @@ export async function checkAllKeys(): Promise<{ ok: number; failed: number }> {
 }
 
 // ----- Enrichment for the UI ------------------------------------------------
-export function withUsage(key: ApiKeyRow, tz: string): Record<string, any> {
-  const summary = usageSummary(key.id, tz);
-  const used = periodTokensUsed(key.id, key.usage_period, tz);
+export async function withUsage(key: ApiKeyRow, tz: string): Promise<Record<string, any>> {
+  const summary = await usageSummary(key.id, tz);
+  const used = await periodTokensUsed(key.id, key.usage_period, tz);
   let plain = "";
   try {
     plain = decrypt(key.api_key_enc);
@@ -130,12 +120,12 @@ export function withUsage(key: ApiKeyRow, tz: string): Record<string, any> {
       hours: summary.busyHour,
     },
     lastCheck: key.last_checked_at,
-    models: modelUsageList(key.id, tz),
+    models: await modelUsageList(key.id, tz),
   };
 }
 
-export function listKeys(): ApiKeyRow[] {
-  return db.prepare("SELECT * FROM api_keys ORDER BY id").all() as ApiKeyRow[];
+export async function listKeys(): Promise<ApiKeyRow[]> {
+  return rows<ApiKeyRow>("api_keys", {}, { order: "id" });
 }
 
 const VALID_PROVIDERS = ["openrouter", "cerebras", "groq", "xai", "openai", "gemini", "other"];
@@ -150,7 +140,7 @@ function safeNum(v: unknown, def = 0): number {
 }
 
 // Shared create logic used by POST /api/keys and POST /api/ai/ollama.
-export function createKeyRow(body: Record<string, unknown>): { id: number } {
+export async function createKeyRow(body: Record<string, unknown>): Promise<{ id: number }> {
   const provider = safeStr(body.provider) || "other";
   if (!VALID_PROVIDERS.includes(provider)) {
     throw new Error("invalid provider");
@@ -164,75 +154,65 @@ export function createKeyRow(body: Record<string, unknown>): { id: number } {
   const usagePeriod = ["daily", "monthly", "total"].includes(String(body.usagePeriod)) ? String(body.usagePeriod) : "monthly";
   const usageHour = Math.max(0, Math.min(23, Math.round(safeNum(body.usageHour, 9))));
   const baseUrl = safeStr(body.baseUrl, 500);
-  const info = db
-    .prepare(
-      `INSERT INTO api_keys(provider, account_name, account_email, api_key_enc, base_url, usage_limit, usage_period, usage_hour)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?)`
-    )
-    .run(
-      provider,
-      accountName,
-      safeStr(body.accountEmail, 300),
-      encrypt(body.apiKey as string),
-      baseUrl,
-      usageLimit,
-      usagePeriod,
-      usageHour
-    );
-  const keyId = Number(info.lastInsertRowid);
-  if (Array.isArray(body.models)) saveKeyModels(keyId, body.models);
+  const inserted = await insertRow<ApiKeyRow>("api_keys", {
+    provider,
+    account_name: accountName,
+    account_email: safeStr(body.accountEmail, 300),
+    api_key_enc: encrypt(body.apiKey as string),
+    base_url: baseUrl,
+    usage_limit: usageLimit,
+    usage_period: usagePeriod,
+    usage_hour: usageHour,
+  });
+  const keyId = Number(inserted.id);
+  if (Array.isArray(body.models)) await saveKeyModels(keyId, body.models);
   return { id: keyId };
 }
 
-export function logKeyUsage(keyId: number, tokens: number, success: boolean, model?: string): void {
-  logUsage(keyId, tokens, success, getSetting("timezone") || "Asia/Dhaka", model);
+export async function logKeyUsage(keyId: number, tokens: number, success: boolean, model?: string): Promise<void> {
+  await logUsage(keyId, tokens, success, (await getSetting("timezone")) || "Asia/Dhaka", model);
 }
 
-export function keyUsageSummary(keyId: number) {
+export async function keyUsageSummary(keyId: number) {
   return usageSummary(keyId);
 }
 
-export function keyUsageHours(keyId: number): number[] {
+export async function keyUsageHours(keyId: number): Promise<number[]> {
   return usageHours(keyId);
 }
 
-export function resetKeyUsage(keyId: number): number {
+export async function resetKeyUsage(keyId: number): Promise<void> {
   return resetUsage(keyId);
 }
 
 // Replace the model list for a key (each model tracks its own free-token limits).
-export function saveKeyModels(keyId: number, models: unknown[]): void {
-  const del = db.prepare("DELETE FROM key_models WHERE key_id = ?");
-  const ins = db.prepare(
-    `INSERT INTO key_models(key_id, model, token_limit, period, usage_hour, rpm, rpd, tpm, enabled)
-     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  );
-  db.transaction(() => {
-    del.run(keyId);
-    for (const raw of models ?? []) {
-      const m = raw as Record<string, unknown>;
-      const model = String(m.model ?? "").trim().slice(0, 200);
-      if (!model) continue;
-      const num = (...vs: unknown[]): number => {
-        for (const v of vs) {
-          const n = parseFloat(String(v ?? ""));
-          if (Number.isFinite(n) && n >= 0) return Math.round(n);
-        }
-        return 0;
-      };
-      ins.run(
-        keyId,
-        model,
-        num(m.tokenLimit, m.tpd, m.tokensPerDay),
-        ["daily", "weekly", "monthly", "total"].includes(String(m.period)) ? String(m.period) : "daily",
-        Math.max(0, Math.min(23, num(m.usageHour, m.usage_hour))),
-        num(m.rpm, m.requestsPerMinute),
-        num(m.rpd, m.requestsPerDay),
-        num(m.tpm, m.tokensPerMinute),
-        m.enabled === false ? 0 : 1
-      );
-    }
-  })();
+export async function saveKeyModels(keyId: number, models: unknown[]): Promise<void> {
+  await deleteRows("key_models", { key_id: keyId });
+  const rowsData: Record<string, unknown>[] = [];
+  for (const raw of models ?? []) {
+    const m = raw as Record<string, unknown>;
+    const model = String(m.model ?? "").trim().slice(0, 200);
+    if (!model) continue;
+    const num = (...vs: unknown[]): number => {
+      for (const v of vs) {
+        const n = parseFloat(String(v ?? ""));
+        if (Number.isFinite(n) && n >= 0) return Math.round(n);
+      }
+      return 0;
+    };
+    rowsData.push({
+      key_id: keyId,
+      model,
+      token_limit: num(m.tokenLimit, m.tpd, m.tokensPerDay),
+      period: ["daily", "weekly", "monthly", "total"].includes(String(m.period)) ? String(m.period) : "daily",
+      usage_hour: Math.max(0, Math.min(23, num(m.usageHour, m.usage_hour))),
+      rpm: num(m.rpm, m.requestsPerMinute),
+      rpd: num(m.rpd, m.requestsPerDay),
+      tpm: num(m.tpm, m.tokensPerMinute),
+      enabled: m.enabled === false ? 0 : 1,
+    });
+  }
+  if (rowsData.length) await insertMany("key_models", rowsData);
 }
 
 export { periodTokensUsed, usageSummary };

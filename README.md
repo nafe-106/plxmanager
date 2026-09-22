@@ -74,7 +74,7 @@ Single-user dashboard to manage API keys and watch/restart Kaggle GPU sessions. 
 ```bash
 curl -X POST http://localhost:3000/api/usage/log \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer tam-usage-log-token" \
+  -H "Authorization: Bearer tam-cf5b87ee02fc237b09e1756a892f63c84227c5eb05ccbb21" \
   -d '{"keyId":1,"tokens":1234,"success":true}'
 ```
 
@@ -84,7 +84,7 @@ curl -X POST http://localhost:3000/api/usage/log \
 import requests
 
 BASE = "http://localhost:3000"
-TOKEN = "tam-usage-log-token"  # your USAGE_LOG_BEARER
+TOKEN = "tam-cf5b87ee02fc237b09e1756a892f63c84227c5eb05ccbb21"  # your USAGE_LOG_BEARER
 
 def log_usage(key_id: int, tokens: int, success: bool = True, cost_usd: float | None = None,
               endpoint: str | None = None):

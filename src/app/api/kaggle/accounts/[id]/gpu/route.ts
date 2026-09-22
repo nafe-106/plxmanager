@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
-import { db, nowSql } from "@/lib/db";
+import { byId, updateRow, nowSql } from "@/lib/store";
 
 export async function POST(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const g = await guard();
@@ -10,14 +10,17 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
   const body = await req.json().catch(() => ({}));
 
   if (body.clearOverride) {
-    db.prepare("UPDATE kaggle_accounts SET remaining_override_h = NULL, override_set_at = NULL WHERE id = ?").run(accountId);
+    await updateRow("kaggle_accounts", accountId, { remaining_override_h: null, override_set_at: null });
     return NextResponse.json({ ok: true });
   }
 
   const hours = Math.max(0, Number(body.hours) || 0);
-  const account = db.prepare("SELECT * FROM kaggle_accounts WHERE id = ?").get(accountId) as any;
+  const account = await byId<any>("kaggle_accounts", accountId);
   if (!account) return NextResponse.json({ error: "not found" }, { status: 404 });
-  db.prepare("UPDATE kaggle_accounts SET remaining_override_h = ?, override_set_at = ?, updated_at = ? WHERE id = ?")
-    .run(hours, nowSql(), nowSql(), accountId);
+  await updateRow("kaggle_accounts", accountId, {
+    remaining_override_h: hours,
+    override_set_at: nowSql(),
+    updated_at: nowSql(),
+  });
   return NextResponse.json({ ok: true });
 }

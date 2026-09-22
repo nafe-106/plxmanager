@@ -9,7 +9,7 @@ export async function POST(_req: Request, ctx: { params: Promise<{ id: string }>
   const g = await guard();
   if (g) return g;
   const { id } = await ctx.params;
-  const account = getAccount(Number(id));
+  const account = await getAccount(Number(id));
   if (!account) return NextResponse.json({ error: "not found" }, { status: 404 });
 
   const quota = await refreshAccountQuota(account.id, true);

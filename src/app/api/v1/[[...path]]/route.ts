@@ -61,7 +61,7 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
   // Clients (OpenClaw etc.) list models before first chat call; be permissive:
   // respond when the key is valid OR the client sends none at all.
   if (req.method === "GET" && /^models\/?$/.test(clientPath)) {
-    const gkProbe = resolveGeneralKeyFromRequest(req);
+    const gkProbe = await resolveGeneralKeyFromRequest(req);
     if (!gkProbe && req.headers.get("authorization")) {
       return errorJson(401, "Invalid API key.", "authentication_error");
     }
@@ -80,7 +80,7 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
     );
   }
 
-  const gk = resolveGeneralKeyFromRequest(req);
+  const gk = await resolveGeneralKeyFromRequest(req);
   if (!gk) {
     return errorJson(401, "Invalid or missing general API key. Send 'Authorization: Bearer tam_gk_…'.", "authentication_error");
   }
@@ -110,7 +110,7 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
   const { keys: candidates } = await modelsForRequest(gk.id, model || undefined);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const picked = pickProviderKey(gk.id, upstreamModel || undefined, candidates);
+    const picked = await pickProviderKey(gk.id, upstreamModel || undefined, candidates);
     if (!picked) {
       return errorJson(
         model ? 404 : 503,

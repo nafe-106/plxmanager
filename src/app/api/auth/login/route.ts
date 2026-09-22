@@ -1,10 +1,17 @@
 import { NextResponse } from "next/server";
-import { createSession, checkPassword } from "@/lib/auth";
+import { createSession, checkPassword, expectedPasswordHash } from "@/lib/auth";
 
 export async function POST(req: Request) {
   const body = await req.json().catch(() => ({}));
   const password = String(body?.password ?? "");
-  if (!checkPassword(password)) {
+  if (!(await checkPassword(password))) {
+    const pwh = await expectedPasswordHash();
+    const hint = process.env.ADMIN_PASSWORD
+      ? `env(len=${process.env.ADMIN_PASSWORD.length})`
+      : pwh
+        ? `dbhash(${pwh.length} chars)`
+        : "nodefault";
+    console.error(`[login] denied; source=${hint}`);
     return NextResponse.json({ error: "Invalid password" }, { status: 401 });
   }
   const token = createSession();

@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { getAllSettings, setSetting, updateSettings, SETTING_DEFAULTS } from "@/lib/settings";
 import { hashPassword } from "@/lib/crypto";
-import { db } from "@/lib/db";
+import { row, deleteRows } from "@/lib/store";
 import { restartSchedulerJobs } from "@/lib/scheduler";
 
 const SECRET_KEYS = [
@@ -23,7 +23,7 @@ function mask(v: string): string {
 export async function GET() {
   const g = await guard();
   if (g) return g;
-  const all = getAllSettings();
+  const all = await getAllSettings();
   const out: Record<string, { value: string; saved: boolean; preview: string } | string> = {};
   for (const [k, v] of Object.entries(all)) {
     if (SECRET_KEYS.includes(k)) {
@@ -32,7 +32,7 @@ export async function GET() {
       out[k] = v;
     }
   }
-  const storedPw = !!db.prepare("SELECT 1 FROM settings WHERE key = 'admin_password_hash'").get();
+  const storedPw = await row("settings", { key: "admin_password_hash" });
   return NextResponse.json({
     settings: out,
     passwordSource: storedPw ? "db" : process.env.ADMIN_PASSWORD ? "env" : "default",
@@ -59,15 +59,15 @@ export async function PUT(req: Request) {
       patch[key] = typeof v === "string" ? v.slice(0, 500) : String(v);
     }
   }
-  updateSettings(patch);
+  await updateSettings(patch);
 
   if (body.admin_password && typeof body.admin_password === "string" && body.admin_password.trim()) {
-    setSetting("admin_password_hash", hashPassword(body.admin_password.trim()));
+    await setSetting("admin_password_hash", hashPassword(body.admin_password.trim()));
   }
   if (body.admin_password_reset) {
-    db.prepare("DELETE FROM settings WHERE key = 'admin_password_hash'").run();
+    await deleteRows("settings", { key: "admin_password_hash" });
   }
 
-  restartSchedulerJobs();
+  void restartSchedulerJobs().catch(() => {});
   return NextResponse.json({ ok: true });
 }

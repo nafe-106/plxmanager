@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Button, Card, Empty, PlexusBadge, Progress, Stat, StatusBadge } from "./ui";
+import { Button, Card, Empty, PlexusBadge, Progress, Stat, StatusBadge, formatTs } from "./ui";
 
 interface Account {
   id: number;
@@ -341,7 +341,7 @@ export default function KaggleManager() {
                       <div className="mt-0.5 text-xs text-zinc-500">
                         {s.slug} · {s.account ? `${s.account.username}${s.account.label ? " (" + s.account.label + ")" : ""}` : "no account"}
                         {s.duration ? ` · running ${s.duration}` : ""}
-                        {s.last_checked_at ? ` · checked ${new Date(s.last_checked_at + "Z").toLocaleTimeString()}` : ""}
+                        {s.last_checked_at ? ` · checked ${formatTs(s.last_checked_at, "time")}` : ""}
                       </div>
                       {s.type === "plexus" && (
                         <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
@@ -359,7 +359,7 @@ export default function KaggleManager() {
                     <StatusBadge status={s.status} />
                     {s.dead ? (
                       <span className="text-xs font-medium text-red-400">
-                        DEAD {s.dead_at ? new Date(s.dead_at + "Z").toLocaleString() : ""}
+                        DEAD {s.dead_at ? formatTs(s.dead_at) : ""}
                       </span>
                     ) : null}
 

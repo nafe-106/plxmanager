@@ -1,5 +1,26 @@
 import { PROVIDERS } from "@/lib/providers";
 
+// Dates come back in two shapes from Supabase:
+//   - "2026-09-22 18:15:08"   (utc_now / nowSql, no timezone marker)
+//   - "2026-09-22T18:15:08.123Z" (toISOString, ends with Z)
+// Append "Z" only when missing so we always get a valid Date.
+export function parseTs(value?: string | null): Date | null {
+  if (!value) return null;
+  const s = String(value).trim();
+  if (!s) return null;
+  const normalized = /z$/i.test(s) ? s : s.includes("T") ? s : s.replace(" ", "T") + "Z";
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+export function formatTs(value?: string | null, dateStyle: "long" | "time" = "long"): string {
+  const d = parseTs(value);
+  if (!d) return "";
+  return dateStyle === "time"
+    ? d.toLocaleTimeString()
+    : d.toLocaleString();
+}
+
 export function providerMeta(id: string) {
   return PROVIDERS.find((p) => p.id === id) ?? PROVIDERS[PROVIDERS.length - 1];
 }

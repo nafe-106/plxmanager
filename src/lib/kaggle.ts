@@ -109,20 +109,23 @@ async function refreshKaggleToken(account: KaggleAccountRow): Promise<boolean> {
   }
 }
 
-async function kagglePost(account: KaggleAccountRow, path: string, body: unknown): Promise<any> {
+async function kaggleRequest(
+  account: KaggleAccountRow,
+  path: string,
+  body?: unknown
+): Promise<any> {
+  const method = body === undefined ? "GET" : "POST";
   const run = async (token: string): Promise<Response> => {
     const bearer = token.startsWith("KGAT_");
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    };
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (body !== undefined) headers["Content-Type"] = "application/json";
     headers.Authorization = bearer
       ? `Bearer ${token}`
       : `Basic ${Buffer.from(`${account.username}:${token}`).toString("base64")}`;
     return fetch(`${KAGGLE_API_BASE}${path}`, {
-      method: "POST",
+      method,
       headers,
-      body: JSON.stringify(body),
+      body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(30000),
     });
   };
@@ -149,10 +152,31 @@ async function kagglePost(account: KaggleAccountRow, path: string, body: unknown
   return res.json();
 }
 
+async function kagglePost(account: KaggleAccountRow, path: string, body: unknown): Promise<any> {
+  return kaggleRequest(account, path, body);
+}
+
+async function kaggleGet(account: KaggleAccountRow, path: string): Promise<any> {
+  return kaggleRequest(account, path);
+}
+
 // ---------------------------------------------------------------------------
-// Real accelerator quota (POST /api/v1/kernels/quota)
+// Real accelerator quota (GET /api/v1/kernels/quota)
 // ---------------------------------------------------------------------------
 function quotaSeconds(value: unknown): number {
+  if (value && typeof value === "object") {
+    const o = value as Record<string, number>;
+    const secs = o.seconds;
+    if (typeof secs === "number" && Number.isFinite(secs)) {
+      const nanos = typeof o.nanos === "number" && Number.isFinite(o.nanos) ? o.nanos : 0;
+      return Math.max(0, secs + nanos / 1e9);
+    }
+    if (Object.prototype.hasOwnProperty.call(o, "seconds")) return Math.max(0, secs || 0);
+    if (Object.prototype.hasOwnProperty.call(o, "timeUsed")) {
+      return quotaSeconds(o.timeUsed);
+    }
+    if (Object.prototype.hasOwnProperty.call(o, "value")) return quotaSeconds(o.value);
+  }
   if (typeof value === "number" && Number.isFinite(value)) return Math.max(0, value);
   if (typeof value === "string") {
     const s = value.trim().toLowerCase();
@@ -173,7 +197,7 @@ export async function fetchQuota(account: KaggleAccountRow): Promise<{
   totalHours: number;
   refreshAt: string | null;
 }> {
-  const j = await kagglePost(account, "/kernels/quota", {});
+  const j = await kaggleGet(account, "/kernels/quota");
   const g = j?.gpuQuota ?? j?.gpu_quota ?? j?.gpu ?? null;
   const rawRefresh = j?.quotaRefreshTime ?? j?.quota_refresh_time ?? null;
   const refreshAt = rawRefresh ? new Date(rawRefresh as string).toISOString() : null;
@@ -262,8 +286,26 @@ const STATUS_MAP: Record<string, string> = {
   stopped: "stopped",
 };
 
+// Kaggle /kernels/status and /kernels/pull are GET endpoints that take the
+// kernel ref split into userName + kernelSlug query params. Stored slugs
+// sometimes carry a "/code/" URL prefix (from the push response ref) or a
+// trailing version — normalize first so API calls never 404 on the path.
+export function kernelRefParts(raw: string): { userName: string; kernelSlug: string } {
+  let s = String(raw || "").trim();
+  s = s.replace(/^https?:\/\/[^/]+/, "");
+  s = s.replace(/^\/?code\//, "");
+  s = s.replace(/\/+$/, "");
+  const parts = s.split("/").filter(Boolean);
+  if (parts.length >= 2 && /^\d+$/.test(parts[parts.length - 1])) parts.pop();
+  const userName = parts[0] || "";
+  const kernelSlug = parts.slice(1).join("/") || "";
+  return { userName, kernelSlug };
+}
+
 export async function kernelStatus(account: KaggleAccountRow, slug: string): Promise<string> {
-  const j = await kagglePost(account, "/kernels/status", { kernelId: slug });
+  const { userName, kernelSlug } = kernelRefParts(slug);
+  const q = new URLSearchParams({ userName, kernelSlug }).toString();
+  const j = await kaggleGet(account, `/kernels/status?${q}`);
   return STATUS_MAP[String(j?.status || "").toLowerCase()] || "unknown";
 }
 
@@ -273,13 +315,16 @@ interface PulledKernel {
 }
 
 export async function pullKernel(account: KaggleAccountRow, slug: string): Promise<PulledKernel> {
-  const j = await kagglePost(account, "/kernels/pull", { kernelId: slug });
+  const { userName, kernelSlug } = kernelRefParts(slug);
+  const q = new URLSearchParams({ userName, kernelSlug }).toString();
+  const j = await kaggleGet(account, `/kernels/pull?${q}`);
   const metadata = j?.metadata ?? {};
   const notebook = j?.newNotebook ?? j?.notebook ?? {};
   let text = "";
-  if (typeof notebook.ipynb === "object") text = JSON.stringify(notebook.ipynb);
-  else if (typeof notebook.script === "string") text = notebook.script;
-  else if (typeof notebook.text === "string") text = notebook.text;
+  if (typeof notebook?.ipynb === "object") text = JSON.stringify(notebook.ipynb);
+  else if (typeof notebook?.script === "string") text = notebook.script;
+  else if (typeof notebook?.text === "string") text = notebook.text;
+  else if (typeof j?.blob?.source === "string") text = j.blob.source;
   if (!text) throw new Error("pulled kernel has no code content");
   return { metadata, text };
 }
@@ -291,26 +336,36 @@ export async function pushKernel(
   newTitle?: string
 ): Promise<any> {
   const m = pulled.metadata;
+  const has = (a: any) => Array.isArray(a) ? a : [];
   const toDataSource = (sources: any) =>
-    (sources || []).map((c: string) =>
+    has(sources).map((c: string) =>
       c.includes("/") ? { ref: c } : { ref: `${account.username}/${c}` }
     );
+  const kernelType = (m.kernel_type || m.kernelType || m.kernelTypeNullable || "notebook")
+    .toString().toLowerCase();
   const request: Record<string, any> = {
     id: m.id ?? null,
     slug: slugName,
-    newTitle: newTitle || m.title || slugName.split("-").join(" "),
+    newTitle:
+      newTitle ||
+      m.title ||
+      (kernelType === "notebook" ? slugName.split("-").join(" ") : m.slug || slugName),
     text: pulled.text,
-    language: (m.language || "python").toLowerCase(),
-    kernelType: (m.kernel_type || "notebook").toLowerCase(),
-    isPrivate: m.is_private ?? true,
-    enableGpu: m.enable_gpu ?? true,
-    enableInternet: m.enable_internet ?? true,
-    enableTpu: m.enable_tpu ?? false,
-    competitionDataSources: toDataSource(m.competition_sources),
-    datasetDataSources: toDataSource(m.dataset_sources),
-    notebookDataSources: toDataSource(m.kernels_sources),
+    language: (m.language || m.languageNullable || "python").toString().toLowerCase(),
+    kernelType,
+    isPrivate: m.is_private ?? m.isPrivate ?? m.isPrivateNullable ?? true,
+    enableGpu: m.enable_gpu ?? m.enableGpu ?? m.enableGpuNullable ?? true,
+    enableInternet: m.enable_internet ?? m.enableInternet ?? m.enableInternetNullable ?? true,
+    enableTpu: m.enable_tpu ?? m.enableTpu ?? m.enableTpuNullable ?? false,
+    competitionDataSources: toDataSource(m.competition_sources ?? m.competitionDataSources),
+    datasetDataSources: toDataSource(m.dataset_sources ?? m.datasetDataSources),
+    notebookDataSources: toDataSource(m.kernels_sources ?? m.kernelDataSources),
     userKeywords: m.user_keywords || [],
-    categoryIds: m.category_ids ?? [],
+    categoryIds: Array.isArray(m.category_ids)
+      ? m.category_ids
+      : typeof m.categoryIds === "string"
+      ? m.categoryIds.split(",").filter(Boolean)
+      : m.categoryIds ?? [],
   };
   return kagglePost(account, "/kernels/push", request);
 }
@@ -756,6 +811,32 @@ async function performSwitchForSession(
   const remaining = await gpuRemainingHours(account);
   const target = await bestSwitchTarget(account.id, await switchThreshold());
   if (!target) {
+    const threshold = await switchThreshold();
+    if (remaining > threshold) {
+      // No other account has quota to switch to, but this one still does —
+      // restart the session in place instead of leaving it dead.
+      const res = await restartSession(s.id);
+      if (!res.ok) {
+        void sendAlert({
+          kind: "session_dead",
+          title: `Auto-restart failed — ${s.label || s.slug}`,
+          lines: [`Error: ${res.error || "unknown"}`, `Session: ${s.label || s.slug}`],
+        });
+        return { ok: false, error: res.error || "restart failed" };
+      }
+      await eventLog(s.id, account.id, s.status, "restart", "auto-restart (no switch target, same account has quota)");
+      void sendAlert({
+        kind: "session_switched",
+        title: `Auto-restarted ${s.label || s.slug} on the same account`,
+        lines: [
+          "Reason: no other account available",
+          `Account: ${account.username} (${remaining.toFixed(1)}h GPU left)`,
+          `New kernel: ${res.slug || s.slug}`,
+          "The Plexus bootstrap will publish the new tunnel URL automatically.",
+        ],
+      });
+      return { ok: true };
+    }
     void sendAlert({
       kind: "session_dead",
       title: `No Kaggle account available to switch to — ${s.label || s.slug}`,
@@ -848,6 +929,35 @@ export async function runAutoSwitcher(): Promise<void> {
   }
 }
 
+// Push the current bundled Plexus notebook to an account. Used by restart and
+// switch so those always deploy the latest script (pull→push could re-run an
+// outdated notebook that's already on Kaggle).
+async function pushBundledPlexus(
+  account: KaggleAccountRow,
+  slugName: string,
+  title?: string
+): Promise<void> {
+  const [supabaseUrlRaw, supabaseKeyRaw, plexusTokenRaw, brainModelRaw, visionModelRaw] =
+    await Promise.all([
+      getSetting("plexus_supabase_url"),
+      getSetting("plexus_supabase_key"),
+      getSetting("plexus_token"),
+      getSetting("plexus_brain_model"),
+      getSetting("plexus_vision_model"),
+    ]);
+  const script = renderPlexusNotebook({
+    supabaseUrl: supabaseUrlRaw || "",
+    supabaseKey: supabaseKeyRaw || "",
+    plexusToken: plexusTokenRaw || "PLEXUS_KAGGLE_2026",
+    brainModel: brainModelRaw || DEFAULT_BRAIN_MODEL,
+    visionModel: visionModelRaw || DEFAULT_VISION_MODEL,
+  });
+  await createKernelFromScript(account, script, {
+    slugName,
+    title: title || "Plexus Ollama GPU Server",
+  });
+}
+
 // Manual restart (re-run on the same account).
 export async function restartSession(sessionId: number): Promise<{ ok: boolean; error?: string; slug?: string }> {
   const s = await getSession(sessionId);
@@ -856,8 +966,14 @@ export async function restartSession(sessionId: number): Promise<{ ok: boolean; 
   if (!account || account.disabled) return { ok: false, error: "account missing or disabled" };
   try {
     const slugName = s.slug.split("/").pop()!;
-    const pulled = await pullKernel(account, s.slug);
-    await pushKernel(account, pulled, slugName);
+    if (s.type === "plexus") {
+      // Repush the bundled notebook (always current code), not a
+      // pull→push of whatever is already on Kaggle.
+      await pushBundledPlexus(account, slugName);
+    } else {
+      const pulled = await pullKernel(account, s.slug);
+      await pushKernel(account, pulled, slugName);
+    }
     await updateRow("kaggle_sessions", sessionId, {
       status: "queued",
       status_changed_at: iso(new Date()),
@@ -880,8 +996,12 @@ export async function switchSessionNow(sessionId: number): Promise<{ ok: boolean
   if (!target) return { ok: false, error: "no other account with ≥1.5h GPU remaining" };
   try {
     const slugName = s.slug.split("/").pop()!;
-    const pulled = await pullKernel(account, s.slug);
-    await pushKernel(target, pulled, slugName);
+    if (s.type === "plexus") {
+      await pushBundledPlexus(target, slugName);
+    } else {
+      const pulled = await pullKernel(account, s.slug);
+      await pushKernel(target, pulled, slugName);
+    }
     const newSlug = `${target.username}/${slugName}`;
     await updateRow("kaggle_sessions", sessionId, {
       account_id: target.id,

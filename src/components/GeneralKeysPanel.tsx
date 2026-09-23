@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Button, Card, Empty } from "./ui";
+import { Button, Card, Empty, formatTs } from "./ui";
 
 interface GkRecord {
   id: number;
@@ -245,8 +245,8 @@ export default function GeneralKeysPanel() {
               </div>
               {k.note && <p className="mt-1 text-xs text-zinc-600">{k.note}</p>}
               <p className="mt-1 text-[11px] text-zinc-600">
-                created {k.created_at ? new Date(k.created_at + "Z").toLocaleString() : "—"} ·{" "}
-                {k.last_used_at ? `last used ${new Date(k.last_used_at + "Z").toLocaleString()}` : "never used"}
+                created {k.created_at ? formatTs(k.created_at) : "—"} ·{" "}
+                {k.last_used_at ? `last used ${formatTs(k.last_used_at)}` : "never used"}
               </p>
             </div>
           ))}

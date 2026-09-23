@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Button, Card, Empty, ProviderBadge, StatusBadge, Progress, Stat } from "./ui";
+import { Button, Card, Empty, ProviderBadge, StatusBadge, Progress, Stat, formatTs } from "./ui";
 import BusyChart from "./BusyChart";
 import GeneralKeysPanel from "./GeneralKeysPanel";
 import { PROVIDERS, GROQ_DEFAULT_MODELS } from "@/lib/providers";
@@ -461,7 +461,7 @@ function KeyRow({
           Delete
         </Button>
         <span className="ml-auto break-all text-[11px] text-zinc-600">
-          {k.last_checked_at ? `last checked ${new Date(k.last_checked_at + "Z").toLocaleString()}` : "never checked"}
+          {k.last_checked_at ? `last checked ${formatTs(k.last_checked_at)}` : "never checked"}
           {k.status === "dead" && k.last_error ? ` · ${k.last_error}` : ""}
           {k.status_detail ? ` · rl: ${k.status_detail}` : ""}
         </span>
@@ -484,7 +484,7 @@ function KeyRow({
                     <div key={c.id} className="flex items-center gap-2 text-xs text-zinc-400">
                       <StatusBadge status={c.status === "reached" ? "alive" : c.status} />
                       <span className="tabular-nums text-zinc-600">
-                        {new Date(c.check_at + "Z").toLocaleString()} · {c.response_ms}ms
+                        {formatTs(c.check_at)} · {c.response_ms}ms
                       </span>
                       {c.error && <span className="truncate text-red-400/80">{c.error}</span>}
                       {c.ratelimit && <span className="truncate text-zinc-600">{c.ratelimit}</span>}

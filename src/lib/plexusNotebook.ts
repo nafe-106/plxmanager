@@ -368,6 +368,11 @@ class Handler(BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
+    # Unbuffered socket writes: every chunk hits the wire immediately so
+    # cloudflared can stream it to Cloudflare without a 100s origin
+    # timeout. Buffering the whole body here is what caused HTTP 524.
+    wbufsize = 0
+
     def authorized(self):
 
         return (
@@ -379,7 +384,7 @@ class Handler(BaseHTTPRequestHandler):
         self,
         status,
         body,
-        content_type="application/json"
+        content_type="application/json",
     ):
 
         if isinstance(body, str):
@@ -404,7 +409,45 @@ class Handler(BaseHTTPRequestHandler):
 
         self.end_headers()
 
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def start_stream(self, status, content_type):
+
+        self.send_response(status)
+
+        self.send_header(
+            "Content-Type",
+            content_type
+        )
+
+        self.send_header(
+            "Transfer-Encoding",
+            "chunked"
+        )
+
+        self.send_header(
+            "Cache-Control",
+            "no-store"
+        )
+
+        self.end_headers()
+
+    def stream_chunk(self, chunk):
+
+        if not chunk:
+            return
+
+        # http chunk framing: <hex size>\r\n<data>\r\n ...
+        self.wfile.write(b"%x\r\n" % len(chunk))
+        self.wfile.write(chunk)
+        self.wfile.write(b"\r\n")
+        self.wfile.flush()
+
+    def end_stream(self):
+
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
 
     def proxy(self):
 
@@ -458,56 +501,50 @@ class Handler(BaseHTTPRequestHandler):
                 timeout=600
             ) as response:
 
-                data = response.read()
+                if self.command == "HEAD":
 
-                self.send_response(
-                    response.status
-                )
+                    self.send_body(
+                        response.status,
+                        b"",
+                        response.headers.get(
+                            "Content-Type",
+                            "application/json"
+                        )
+                    )
 
-                self.send_header(
-                    "Content-Type",
+                    return
+
+                self.start_stream(
+                    response.status,
                     response.headers.get(
                         "Content-Type",
                         "application/json"
                     )
                 )
 
-                self.send_header(
-                    "Content-Length",
-                    str(len(data))
-                )
+                while True:
 
-                self.send_header(
-                    "Cache-Control",
-                    "no-store"
-                )
+                    chunk = response.read(65536)
 
-                self.end_headers()
+                    if not chunk:
+                        break
 
-                self.wfile.write(data)
+                    self.stream_chunk(chunk)
+
+                self.end_stream()
 
         except urllib.error.HTTPError as e:
 
             data = e.read()
 
-            self.send_response(e.code)
-
-            self.send_header(
-                "Content-Type",
+            self.send_body(
+                e.code,
+                data,
                 e.headers.get(
                     "Content-Type",
                     "application/json"
                 )
             )
-
-            self.send_header(
-                "Content-Length",
-                str(len(data))
-            )
-
-            self.end_headers()
-
-            self.wfile.write(data)
 
         except Exception:
 
@@ -1072,6 +1109,31 @@ print(
 print(
     STATE["public_url"]
 )
+
+# ============================================================
+# MAIN THREAD MUST NEVER RETURN.
+#
+# If this top-level script finishes, Kaggle marks the run
+# "complete" and terminates the whole runtime — Ollama, the
+# proxy and cloudflared all die with it. The daemon threads
+# above do NOT keep the process alive, so park the main thread
+# here instead of letting the script end.
+# ============================================================
+
+print()
+print("Parking main thread (run stays alive).")
+
+while True:
+    time.sleep(300)
+
+    url = STATE.get("public_url")
+
+    if url:
+
+        save_connection()
+
+        if PUBLISH_ENABLED:
+            publish_connection(url)
 `;
 
 export interface PlexusNotebookOptions {

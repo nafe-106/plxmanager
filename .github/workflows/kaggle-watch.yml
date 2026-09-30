@@ -11,6 +11,7 @@ jobs:
   tick:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    environment: production
     concurrency:
       group: kaggle-watcher
       cancel-in-progress: false

@@ -6,7 +6,7 @@ import { startPlexusSession } from "@/lib/kaggle";
 // Push the bundled Plexus bootstrap (Ollama + proxy + Cloudflare + Supabase
 // keep-alive) to an account and start watching it.
 //
-// body: { accountId, label?, slugName?, title?, brainModel?, visionModel? }
+// body: { accountId, label?, slugName?, title?, brainModel?, visionModel?, extraModels? }
 export async function POST(req: Request) {
   const g = await guard();
   if (g) return g;
@@ -20,6 +20,12 @@ export async function POST(req: Request) {
     title: body.title ? String(body.title) : undefined,
     brainModel: body.brainModel ? String(body.brainModel) : undefined,
     visionModel: body.visionModel ? String(body.visionModel) : undefined,
+    extraModels:
+      typeof body.extraModels === "string"
+        ? String(body.extraModels)
+        : Array.isArray(body.extraModels)
+          ? body.extraModels.map((m: unknown) => String(m))
+          : undefined,
   });
   if (!res.ok) return NextResponse.json({ error: res.error }, { status: 400 });
   return NextResponse.json(res, { status: 201 });

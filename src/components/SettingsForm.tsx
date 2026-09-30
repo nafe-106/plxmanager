@@ -68,6 +68,7 @@ export default function SettingsForm() {
       plexus_switch_threshold_h: values.plexus_switch_threshold_h,
       plexus_brain_model: values.plexus_brain_model,
       plexus_vision_model: values.plexus_vision_model,
+      plexus_extra_models: values.plexus_extra_models,
     };
     if (newPassword.trim()) body.admin_password = newPassword.trim();
     if (resetPassword) body.admin_password_reset = true;
@@ -166,6 +167,13 @@ export default function SettingsForm() {
             <input className={inputCls} value={values.plexus_vision_model ?? "qwen2.5vl:7b"} onChange={(e) => setVal("plexus_vision_model", e.target.value)} />
           </Field>
         </div>
+        <Field label="Extra models to auto-download (comma separated)">
+          <input className={inputCls} value={values.plexus_extra_models ?? ""} onChange={(e) => setVal("plexus_extra_models", e.target.value)} placeholder="e.g. llama3.1:8b, qwen3:8b, mistral:7b" />
+        </Field>
+        <p className="text-xs text-zinc-500">
+          Pulled (and kept) on every Plexus session start, restart and auto-switch, alongside the brain and vision
+          models above. Leave empty for brain + vision only.
+        </p>
         <label className="flex items-center gap-2 text-sm text-zinc-300">
           <input type="checkbox" checked={!!checks.plexus_auto_switch} onChange={(e) => setChecks((p) => ({ ...p, plexus_auto_switch: e.target.checked }))} />
           Auto-switch accounts when GPU limit is reached

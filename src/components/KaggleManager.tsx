@@ -639,6 +639,7 @@ function StartSessionForm({
   const [label, setLabel] = useState("");
   const [brainModel, setBrainModel] = useState("qwen3:30b");
   const [visionModel, setVisionModel] = useState("qwen2.5vl:7b");
+  const [extraModels, setExtraModels] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -655,6 +656,7 @@ function StartSessionForm({
           label,
           brainModel,
           visionModel,
+          extraModels,
         }),
       });
       const j = await res.json();
@@ -689,6 +691,9 @@ function StartSessionForm({
           <Field label="Brain model"><input className={inputCls} value={brainModel} onChange={(e) => setBrainModel(e.target.value)} /></Field>
           <Field label="Vision model"><input className={inputCls} value={visionModel} onChange={(e) => setVisionModel(e.target.value)} /></Field>
         </div>
+        <Field label="Extra models (comma separated, optional)">
+          <input className={inputCls} value={extraModels} onChange={(e) => setExtraModels(e.target.value)} placeholder="llama3.1:8b, qwen3:8b, mistral:7b" />
+        </Field>
         <p className="text-xs text-zinc-500">
           Pushes the bundled bootstrap (Ollama + authenticated proxy + Cloudflare tunnel + Supabase keep-alive)
           to the selected account and starts it. GPU + internet are enabled, script kernel type.

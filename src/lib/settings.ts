@@ -19,6 +19,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   plexus_switch_threshold_h: "1.5",
   plexus_brain_model: "qwen3:30b",
   plexus_vision_model: "qwen2.5vl:7b",
+  plexus_extra_models: "",
 };
 
 // Allow the Plexus/Supabase settings to be supplied via env vars instead of

@@ -11,11 +11,12 @@
 //
 // Placeholders below are replaced with the app's saved settings at push time:
 //   __PLEXUS_SUPABASE_URL__ / __PLEXUS_SUPABASE_KEY__ / __PLEXUS_TOKEN__
-//   __BRAIN_MODEL__ / __VISION_MODEL__
+//   __BRAIN_MODEL__ / __VISION_MODEL__ / __EXTRA_MODELS__
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_BRAIN_MODEL = "qwen3:30b";
 export const DEFAULT_VISION_MODEL = "qwen2.5vl:7b";
+export const DEFAULT_EXTRA_MODELS: string[] = [];
 export const DEFAULT_SLUG = "plexus-ollama";
 
 export const PLEXUS_NOTEBOOK = String.raw`# ============================================================
@@ -47,6 +48,7 @@ import urllib.request
 
 BRAIN_MODEL = "__BRAIN_MODEL__"
 VISION_MODEL = "__VISION_MODEL__"
+EXTRA_MODELS = __EXTRA_MODELS__
 
 PLEXUS_TOKEN = "__PLEXUS_TOKEN__"
 
@@ -343,6 +345,9 @@ def ensure_model(model):
 
 ensure_model(BRAIN_MODEL)
 ensure_model(VISION_MODEL)
+
+for model in EXTRA_MODELS:
+    ensure_model(model)
 
 
 # ============================================================
@@ -1142,6 +1147,7 @@ export interface PlexusNotebookOptions {
   plexusToken: string;
   brainModel?: string;
   visionModel?: string;
+  extraModels?: string[];
 }
 
 export function renderPlexusNotebook(opts: PlexusNotebookOptions): string {
@@ -1149,5 +1155,6 @@ export function renderPlexusNotebook(opts: PlexusNotebookOptions): string {
     .replace(/__PLEXUS_SUPABASE_KEY__/g, opts.supabaseKey || "")
     .replace(/__PLEXUS_TOKEN__/g, opts.plexusToken || "PLEXUS_KAGGLE_2026")
     .replace(/__BRAIN_MODEL__/g, opts.brainModel || DEFAULT_BRAIN_MODEL)
-    .replace(/__VISION_MODEL__/g, opts.visionModel || DEFAULT_VISION_MODEL);
+    .replace(/__VISION_MODEL__/g, opts.visionModel || DEFAULT_VISION_MODEL)
+    .replace(/__EXTRA_MODELS__/g, JSON.stringify(opts.extraModels?.filter(Boolean) || []));
 }

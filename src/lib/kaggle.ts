@@ -411,6 +411,18 @@ export interface StartPlexusSessionOptions {
   title?: string;
   brainModel?: string;
   visionModel?: string;
+  extraModels?: string[] | string;
+}
+
+// Parse a user-provided model list ("qwen3:8b, llamma3.1:8b" / newlines /
+// semicolons) into a safe array of model names for the notebook.
+function parseExtraModels(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  const names = raw
+    .split(/[\n,;]+/)
+    .map((s) => s.trim().replace(/^["'`]+|["'`]+$/g, ""))
+    .filter(Boolean);
+  return [...new Set(names)].filter((n) => /^[A-Za-z0-9][A-Za-z0-9_.:@/+ -]*$/.test(n));
 }
 
 /**
@@ -462,18 +474,23 @@ export async function startPlexusSession(
     plexusTokenRaw,
     brainModelRaw,
     visionModelRaw,
+    extraModelsRaw,
   ] = await Promise.all([
     getSetting("plexus_supabase_url"),
     getSetting("plexus_supabase_key"),
     getSetting("plexus_token"),
     getSetting("plexus_brain_model"),
     getSetting("plexus_vision_model"),
+    getSetting("plexus_extra_models"),
   ]);
   const supabaseUrl = supabaseUrlRaw || "";
   const supabaseKey = supabaseKeyRaw || "";
   const plexusToken = plexusTokenRaw || "PLEXUS_KAGGLE_2026";
   const brainModel = brainModelRaw || DEFAULT_BRAIN_MODEL;
   const visionModel = visionModelRaw || DEFAULT_VISION_MODEL;
+  const extraModels = Array.isArray(opts.extraModels)
+    ? opts.extraModels
+    : parseExtraModels(opts.extraModels ?? extraModelsRaw);
 
   const script = renderPlexusNotebook({
     supabaseUrl,
@@ -481,6 +498,7 @@ export async function startPlexusSession(
     plexusToken,
     brainModel: opts.brainModel || brainModel,
     visionModel: opts.visionModel || visionModel,
+    extraModels,
   });
 
   try {
@@ -937,13 +955,14 @@ async function pushBundledPlexus(
   slugName: string,
   title?: string
 ): Promise<void> {
-  const [supabaseUrlRaw, supabaseKeyRaw, plexusTokenRaw, brainModelRaw, visionModelRaw] =
+  const [supabaseUrlRaw, supabaseKeyRaw, plexusTokenRaw, brainModelRaw, visionModelRaw, extraModelsRaw] =
     await Promise.all([
       getSetting("plexus_supabase_url"),
       getSetting("plexus_supabase_key"),
       getSetting("plexus_token"),
       getSetting("plexus_brain_model"),
       getSetting("plexus_vision_model"),
+      getSetting("plexus_extra_models"),
     ]);
   const script = renderPlexusNotebook({
     supabaseUrl: supabaseUrlRaw || "",
@@ -951,6 +970,7 @@ async function pushBundledPlexus(
     plexusToken: plexusTokenRaw || "PLEXUS_KAGGLE_2026",
     brainModel: brainModelRaw || DEFAULT_BRAIN_MODEL,
     visionModel: visionModelRaw || DEFAULT_VISION_MODEL,
+    extraModels: parseExtraModels(extraModelsRaw),
   });
   await createKernelFromScript(account, script, {
     slugName,

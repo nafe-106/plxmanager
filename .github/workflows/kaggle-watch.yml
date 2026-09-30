@@ -1,0 +1,35 @@
+name: Kaggle watcher
+
+on:
+  schedule:
+    # Every 5 minutes (GitHub Actions minimum). Hobby Vercel can't run hourly
+    # cron jobs, so this replaces vercel.json crons.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: kaggle-watcher
+      cancel-in-progress: false
+    steps:
+      - name: Trigger Kaggle watcher endpoint
+        run: |
+          BEARER="${{ secrets.CRON_SECRET || secrets.USAGE_LOG_BEARER || '' }}"
+          if [ -z "$BEARER" ]; then
+            echo "::error::No secret set: add a GitHub secret 'CRON_SECRET' (or 'USAGE_LOG_BEARER') equal to a token the deployed app accepts."
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/kaggle-watch.out -w "%{http_code}" \
+            -H "Authorization: Bearer $BEARER" \
+            -H "x-cron-secret: $BEARER" \
+            https://plxmanager.vercel.app/api/cron/kaggle)
+          echo "HTTP $code"
+          cat /tmp/kaggle-watch.out
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::Watcher endpoint returned non-200 (auth env on Vercel may be unset)."
+            exit 1
+          fi

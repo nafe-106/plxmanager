@@ -13,6 +13,7 @@ interface Account {
   disabled: number;
   used_hours: number;
   remaining_hours: number;
+  available_hours: number;
   quota_used_h: number | null;
   quota_total_h: number | null;
   quota_reserved_h: number | null;
@@ -221,7 +222,7 @@ export default function KaggleManager() {
             <Stat
               label="GPU used / quota"
               value={`${(overview?.gpuUsedHours ?? 0).toFixed(1)} / ${(overview?.gpuQuotaHours ?? 0).toFixed(1)}h`}
-              sub={`${overview?.gpuReservedHours ? `${overview.gpuReservedHours.toFixed(1)}h reserved · ` : ""}${(overview?.totalRemainingHours ?? 0).toFixed(1)}h left`}
+              sub={`${overview?.gpuReservedHours ? `${overview.gpuReservedHours.toFixed(1)}h held · ` : ""}${((overview?.gpuQuotaHours ?? 0) - (overview?.gpuUsedHours ?? 0)).toFixed(1)}h left`}
             />
             <Stat label="Sessions running" value={overview?.running ?? 0} tone="green" />
             <Stat label="Dead sessions" value={overview?.dead ?? 0} tone={overview?.dead ? "red" : "default"} />
@@ -257,10 +258,10 @@ export default function KaggleManager() {
                         </div>
                         <div className="w-48">
                           <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-500">
-                            <span>{apiQuota ? `GPU used ${used}h · reserved ${(a.quota_reserved_h ?? 0).toFixed(1)}h` : `Used ${used}h (local)`}</span>
+                            <span title="Reserved = kept aside for the running session; released back when it stops.">{apiQuota ? `GPU used ${used}h · ${(a.quota_reserved_h ?? 0).toFixed(1)}h held` : `Used ${used}h (local)`}</span>
                             <span className={usedPct >= 90 ? "text-red-400" : usedPct >= 70 ? "text-amber-300" : "text-emerald-400"}>
-                              {a.remaining_hours}h left
-                            </span>
+                            {(a.available_hours ?? a.remaining_hours).toFixed(1)}h left
+                          </span>
                           </div>
                           <Progress pct={usedPct} />
                         </div>

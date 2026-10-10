@@ -13,11 +13,15 @@ export async function GET() {
     const { api_key_enc, ...rest } = a;
     const account = await getAccount(a.id);
     const hasApiQuota = a.quota_source === "api" && Number(a.quota_total_h) > 0;
+    const usedLocal = await gpuUsedHoursThisWeek(a.id);
+    const total = hasApiQuota ? Number(a.quota_total_h) : a.weekly_gpu_quota_h;
+    const used = hasApiQuota ? Number(a.quota_used_h ?? 0) : usedLocal;
     accounts.push({
       ...rest,
       masked_key: a.api_key_enc ? a.username.slice(0, 2) + "…" : "",
-      used_hours: Math.round((await gpuUsedHoursThisWeek(a.id)) * 10) / 10,
+      used_hours: Math.round(usedLocal * 10) / 10,
       remaining_hours: account ? Math.round((await gpuRemainingHours(account)) * 10) / 10 : 0,
+      available_hours: Math.round((total - used) * 10) / 10,
       quota_used_h: hasApiQuota ? Math.round((a.quota_used_h ?? 0) * 10) / 10 : null,
       quota_total_h: hasApiQuota ? Math.round((a.quota_total_h ?? 0) * 10) / 10 : null,
       quota_reserved_h: hasApiQuota ? Math.round((a.quota_reserved_h ?? 0) * 10) / 10 : null,

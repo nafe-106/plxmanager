@@ -372,7 +372,7 @@ export default function KaggleManager() {
                       >
                         {busy("switch-" + s.id) ? "Switching…" : "Switch account"}
                       </Button>
-                      <Button variant="secondary" onClick={() => pause(s)}>{s.paused ? "Resume" : "Pause"}</Button>
+                      <Button variant="secondary" onClick={() => pause(s)} title={s.paused ? "Resume watching this session. Its Kaggle VM is NOT stopped by pause." : "Pause watching this session. NOTE: this does NOT stop the Kaggle VM — the kernel keeps running on Kaggle until you stop/delete it there."}>{s.paused ? "Resume" : "Pause"}</Button>
                       <Button variant="danger" onClick={() => removeSession(s)}>Delete</Button>
                     </div>
                   </div>

@@ -302,6 +302,28 @@ export function kernelRefParts(raw: string): { userName: string; kernelSlug: str
   return { userName, kernelSlug };
 }
 
+export interface KernelListItem {
+  ref: string;
+  title: string;
+  lastRunTime: string | null;
+}
+
+// List the real notebooks that exist on an account's Kaggle (authenticated).
+export async function listAccountNotebooks(account: KaggleAccountRow): Promise<KernelListItem[]> {
+  const j = await kaggleGet(
+    account,
+    `/kernels/list?user=${encodeURIComponent(account.username)}&pageSize=100&sortBy=dateRun`
+  );
+  if (!Array.isArray(j)) return [];
+  return j
+    .map((k: any) => ({
+      ref: String(k?.ref || ""),
+      title: String(k?.title || ""),
+      lastRunTime: k?.lastRunTime || null,
+    }))
+    .filter((k) => k.ref);
+}
+
 export async function kernelStatus(account: KaggleAccountRow, slug: string): Promise<string> {
   const { userName, kernelSlug } = kernelRefParts(slug);
   const q = new URLSearchParams({ userName, kernelSlug }).toString();

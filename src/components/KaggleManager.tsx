@@ -559,6 +559,8 @@ function SessionForm({
 }) {
   const [accountId, setAccountId] = useState(session ? String(session.account_id) : String(accounts[0]?.id ?? ""));
   const [slug, setSlug] = useState(session?.slug ?? "");
+  const [slugOptions, setSlugOptions] = useState<{ ref: string; title: string }[] | null>(null);
+  const [loadingSlug, setLoadingSlug] = useState(false);
   const [label, setLabel] = useState(session?.label ?? "");
   const [type, setType] = useState(session?.type ?? "notebook");
   const [autoSwitch, setAutoSwitch] = useState(session ? session.auto_switch === 1 : true);
@@ -609,7 +611,43 @@ function SessionForm({
           </select>
         </Field>
         <Field label="Notebook slug *">
-          <input className={inputCls} required value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="owner/notebook-name" />
+          <div className="flex items-center gap-2">
+            <input className={inputCls} required value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="owner/notebook-name" />
+            <Button
+              variant="secondary"
+              disabled={loadingSlug}
+              onClick={async () => {
+                setLoadingSlug(true);
+                setError("");
+                try {
+                  const res = await fetch(`/api/kaggle/accounts/${accountId}/notebooks`);
+                  const j = await res.json();
+                  if (!res.ok) throw new Error(j.error || "failed to load");
+                  setSlugOptions(j.notebooks ?? []);
+                  if (!slug && j.notebooks?.length) setSlug(j.notebooks[0].ref);
+                } catch (err: any) {
+                  setError(err.message || "failed to load notebooks");
+                } finally {
+                  setLoadingSlug(false);
+                }
+              }}
+            >
+              {loadingSlug ? "Loading…" : "Load from Kaggle"}
+            </Button>
+          </div>
+          {slugOptions && slugOptions.length > 0 && (
+            <div className="mt-1 flex items-center gap-2">
+              <select className={inputCls} value={slugOptions.some((o) => o.ref === slug) ? slug : ""} onChange={(e) => e.target.value && setSlug(e.target.value)}>
+                <option value="">— pick a notebook —</option>
+                {slugOptions.map((o) => (
+                  <option key={o.ref} value={o.ref}>{o.title || o.ref} · {o.ref}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {slugOptions && slugOptions.length === 0 && (
+            <p className="text-sm text-zinc-500">No notebooks found on this account yet.</p>
+          )}
         </Field>
         <Field label="Label (optional)"><input className={inputCls} value={label} onChange={(e) => setLabel(e.target.value)} /></Field>
         <label className="flex items-center gap-2 text-sm text-zinc-400">

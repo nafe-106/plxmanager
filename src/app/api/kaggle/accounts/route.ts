@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { rows, insertRow } from "@/lib/store";
 import { encrypt } from "@/lib/crypto";
-import { getAccount, gpuUsedHoursThisWeek, gpuRemainingHours, weeklyGpuHistory } from "@/lib/kaggle";
+import { getAccount, gpuUsedHoursThisWeek, gpuRemainingHours, dailyGpuHistory } from "@/lib/kaggle";
 
 export async function GET() {
   const g = await guard();
@@ -23,7 +23,7 @@ export async function GET() {
       quota_reserved_h: hasApiQuota ? Math.round((a.quota_reserved_h ?? 0) * 10) / 10 : null,
       quota_refresh_at: hasApiQuota ? (a.quota_refresh_at ?? null) : null,
       quota_source: a.quota_source ?? "local",
-      history: await weeklyGpuHistory(a.id),
+      history: await dailyGpuHistory(a.id),
     });
   }
   return NextResponse.json({ accounts });

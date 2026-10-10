@@ -19,7 +19,7 @@ interface Account {
   quota_refresh_at: string | null;
   quota_source: string;
   masked_key: string;
-  history: { weekStart: string; hours: number }[];
+  history: { day: string; weekday: string; hours: number }[];
 }
 
 interface Session {
@@ -50,6 +50,7 @@ interface Overview {
   running: number;
   dead: number;
   gpuUsedHours: number;
+  gpuReservedHours: number;
   gpuQuotaHours: number;
   totalRemainingHours: number;
 }
@@ -194,19 +195,6 @@ export default function KaggleManager() {
     await load();
   }
 
-  const totals = useMemo(() => {
-    let used = 0;
-    let quota = 0;
-    let rem = 0;
-    for (const a of accounts) {
-      if (a.disabled) continue;
-      used += a.used_hours;
-      quota += a.weekly_gpu_quota_h;
-      rem += a.remaining_hours;
-    }
-    return { used, quota, rem };
-  }, [accounts]);
-
   return (
     <div className="space-y-4">
       {toast && (
@@ -230,7 +218,11 @@ export default function KaggleManager() {
         <>
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="Accounts" value={accounts.filter((a) => !a.disabled).length} />
-            <Stat label="GPU used / quota" value={`${totals.used.toFixed(1)} / ${totals.quota.toFixed(1)}h`} sub={`${totals.rem.toFixed(1)}h left`} />
+            <Stat
+              label="GPU used / quota"
+              value={`${(overview?.gpuUsedHours ?? 0).toFixed(1)} / ${(overview?.gpuQuotaHours ?? 0).toFixed(1)}h`}
+              sub={`${overview?.gpuReservedHours ? `${overview.gpuReservedHours.toFixed(1)}h reserved · ` : ""}${(overview?.totalRemainingHours ?? 0).toFixed(1)}h left`}
+            />
             <Stat label="Sessions running" value={overview?.running ?? 0} tone="green" />
             <Stat label="Dead sessions" value={overview?.dead ?? 0} tone={overview?.dead ? "red" : "default"} />
           </div>
@@ -265,7 +257,7 @@ export default function KaggleManager() {
                         </div>
                         <div className="w-48">
                           <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-500">
-                            <span>{apiQuota ? `GPU used ${used}h` : `Used ${used}h (local)`}</span>
+                            <span>{apiQuota ? `GPU used ${used}h · reserved ${(a.quota_reserved_h ?? 0).toFixed(1)}h` : `Used ${used}h (local)`}</span>
                             <span className={usedPct >= 90 ? "text-red-400" : usedPct >= 70 ? "text-amber-300" : "text-emerald-400"}>
                               {a.remaining_hours}h left
                             </span>
@@ -292,18 +284,18 @@ export default function KaggleManager() {
                         <div className="mt-3">
                           <div className="mb-1 flex gap-1">
                             {a.history.map((h, i) => (
-                              <div key={h.weekStart} className="flex-1">
+                              <div key={h.day} className="flex-1" title={`${h.day} · ${h.hours}h`}>
                                 <div className="flex h-10 items-end rounded-sm bg-zinc-900">
                                   <div
                                     className="w-full rounded-sm bg-emerald-600/70"
                                     style={{ height: h.hours > 0 ? Math.max(8, (h.hours / max) * 100) + "%" : 4 }}
                                   />
                                 </div>
-                                <p className="mt-0.5 text-center text-[9px] tabular-nums text-zinc-600">{h.hours}h</p>
+                                <p className={`mt-0.5 text-center text-[9px] tabular-nums ${i === a.history.length - 1 ? "text-zinc-400" : "text-zinc-600"}`}>{h.weekday}</p>
                               </div>
                             ))}
                           </div>
-                          <p className="text-[10px] text-zinc-600">Weekly GPU history (last {a.history.length} weeks)</p>
+                          <p className="text-[10px] text-zinc-600">GPU hours this week (by day)</p>
                         </div>
                       )}
                     </div>

@@ -1,8 +1,8 @@
 import { byId, row, rows, insertRow, updateRow, deleteRows, upsertRows, nowSql } from "./store";
 import { decrypt, encrypt } from "./crypto";
-import { getSetting, setSetting, timezone } from "./settings";
+import { getSetting, setSetting, getAllSettings, timezone } from "./settings";
 import { sendAlert } from "./alerts";
-import { weekStartKey, tzParts, addDays } from "./usage";
+import { weekStartKey, tzParts, addDays, dayKey } from "./usage";
 import { renderPlexusNotebook, DEFAULT_BRAIN_MODEL, DEFAULT_VISION_MODEL, DEFAULT_SLUG } from "./plexusNotebook";
 
 export const KAGGLE_API_BASE =
@@ -565,6 +565,11 @@ export async function addGpuSeconds(accountId: number, seconds: number, tz?: str
     [{ account_id: accountId, week_start: wk, seconds_run: (prev?.seconds_run ?? 0) + seconds }],
     "account_id,week_start"
   );
+
+  const day = dayKey(zone);
+  const dkey = `${DAILY_KEY_PREFIX}${accountId}_${day}`;
+  const dprev = Number((await getSetting(dkey)) ?? 0);
+  await setSetting(dkey, String(dprev + seconds));
 }
 
 export async function gpuUsedSecondsThisWeek(accountId: number, tz?: string, resetDay?: number): Promise<number> {
@@ -601,34 +606,31 @@ export function quotaSnapshotFor(account: KaggleAccountRow): QuotaSnapshot | nul
   return storedQuota(account);
 }
 
-export interface GpuWeekBucket {
-  weekStart: string;
+const WEEKDAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const DAILY_KEY_PREFIX = "gpu_day_";
+
+export interface GpuDayBucket {
+  day: string;
+  weekday: string;
   hours: number;
 }
 
-export async function weeklyGpuHistory(accountId: number, n = 8): Promise<GpuWeekBucket[]> {
+// Current reset-week, split into the 7 days (tz-aware) with weekday labels.
+export async function dailyGpuHistory(accountId: number): Promise<GpuDayBucket[]> {
   const account = await getAccount(accountId);
   if (!account) return [];
   const zone = await timezone();
-  const reset = account.week_reset_day;
-  const cur = weekStartKey(zone, reset);
-  const starts: string[] = [cur];
-  let prev = cur;
-  for (let i = 1; i < n; i++) {
-    const [y, m, d] = prev.split("-").map(Number);
-    const dt = new Date(Date.UTC(y, m - 1, d - 7));
-    prev = `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
-    starts.push(prev);
+  const start = weekStartKey(zone, account.week_reset_day);
+  const all = await getAllSettings();
+  const out: GpuDayBucket[] = [];
+  for (let i = 0; i < 7; i++) {
+    const day = addDays(start, i);
+    const seconds = Number(all[`${DAILY_KEY_PREFIX}${accountId}_${day}`] ?? 0);
+    const [y, m, d] = day.split("-").map(Number);
+    const weekday = WEEKDAY_SHORT[new Date(Date.UTC(y, m - 1, d)).getUTCDay()];
+    out.push({ day, weekday, hours: Math.round((seconds / 3600) * 10) / 10 });
   }
-  const rowsArr = await rows<{ week_start: string; seconds_run: number }>("gpu_usage_weekly", {
-    account_id: accountId,
-  });
-  return starts
-    .map((weekStart) => {
-      const s = rowsArr.filter((r) => r.week_start === weekStart).reduce((sum, r) => sum + (r.seconds_run ?? 0), 0);
-      return { weekStart, hours: Math.round((s / 3600) * 10) / 10 };
-    })
-    .reverse();
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1079,7 +1081,16 @@ export async function kaggleOverview() {
   const running = sessions.filter((s) => s.status === "running").length;
   const dead = sessions.filter((s) => s.dead).length;
   let gpuUsed = 0;
-  for (const a of accounts) gpuUsed += await gpuUsedHoursThisWeek(a.id);
+  let gpuReserved = 0;
+  for (const a of accounts) {
+    const isApi = a.quota_source === "api" && (a.quota_total_h ?? 0) > 0;
+    if (isApi) {
+      gpuUsed += a.quota_used_h ?? 0;
+      gpuReserved += a.quota_reserved_h ?? 0;
+    } else {
+      gpuUsed += await gpuUsedHoursThisWeek(a.id);
+    }
+  }
   const gpuQuota = accounts.reduce((sum, a) => sum + a.weekly_gpu_quota_h, 0);
   let totalRemaining = 0;
   for (const a of accounts) totalRemaining += await gpuRemainingHours(a);
@@ -1089,6 +1100,7 @@ export async function kaggleOverview() {
     running,
     dead,
     gpuUsedHours: Math.round(gpuUsed * 10) / 10,
+    gpuReservedHours: Math.round(gpuReserved * 10) / 10,
     gpuQuotaHours: Math.round(gpuQuota * 10) / 10,
     totalRemainingHours: Math.round(totalRemaining * 10) / 10,
   };

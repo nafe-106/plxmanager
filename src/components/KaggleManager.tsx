@@ -366,7 +366,7 @@ export default function KaggleManager() {
                       </Button>
                       <Button
                         variant="secondary"
-                        title="Move this session to the account with the most GPU hours left"
+                        title="Move this session to the next account in rotation (account1 → account2 → … → account1)"
                         disabled={busy("switch-" + s.id)}
                         onClick={() => doSwitch(s)}
                       >

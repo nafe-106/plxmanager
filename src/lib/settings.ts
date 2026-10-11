@@ -16,7 +16,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   plexus_supabase_key: "",
   plexus_token: "PLEXUS_KAGGLE_2026",
   plexus_auto_switch: "1",
-  plexus_switch_threshold_h: "1.5",
+  plexus_switch_threshold_h: "0.5",
   plexus_brain_model: "qwen3:30b",
   plexus_vision_model: "qwen2.5vl:7b",
   plexus_extra_models: "",

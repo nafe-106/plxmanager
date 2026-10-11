@@ -818,20 +818,20 @@ async function switchThreshold(): Promise<number> {
   return Number.isFinite(t) && t > 0 ? t : 1.5;
 }
 
-async function bestSwitchTarget(currentAccountId: number, minRemaining = 1.5): Promise<KaggleAccountRow | null> {
-  const accounts = await rows<KaggleAccountRow>("kaggle_accounts", { disabled: 0 });
-  let best: KaggleAccountRow | null = null;
-  let bestRemaining = -1;
-  for (const a of accounts) {
+// Round-robin target: the NEXT enabled account (by creation order, wrapping
+// around) that still has ≥ minRemaining GPU hours. Rotation looks like
+// account1 → account2 → ... → account6 → account1 → ... so every account is
+// drained in sequence instead of always jumping to whichever has the most.
+async function rotationSwitchTarget(currentAccountId: number, minRemaining = 1.5): Promise<KaggleAccountRow | null> {
+  const accounts = await rows<KaggleAccountRow>("kaggle_accounts", { disabled: 0 }, { order: "id" });
+  if (accounts.length <= 1) return null;
+  const idx = accounts.findIndex((a) => a.id === currentAccountId);
+  const ordered = idx >= 0 ? accounts.slice(idx + 1).concat(accounts.slice(0, idx)) : accounts;
+  for (const a of ordered) {
     if (a.id === currentAccountId) continue;
-    const remaining = await gpuRemainingHours(a);
-    if (remaining < minRemaining) continue;
-    if (remaining > bestRemaining) {
-      bestRemaining = remaining;
-      best = a;
-    }
+    if ((await gpuRemainingHours(a)) >= minRemaining) return a;
   }
-  return best;
+  return null;
 }
 
 async function switchCooledDown(sessionId: number): Promise<boolean> {
@@ -851,7 +851,7 @@ async function performSwitchForSession(
   const account = await getAccount(s.account_id);
   if (!account) return { ok: false, error: "account missing" };
   const remaining = await gpuRemainingHours(account);
-  const target = await bestSwitchTarget(account.id, await switchThreshold());
+  const target = await rotationSwitchTarget(account.id, await switchThreshold());
   if (!target) {
     const threshold = await switchThreshold();
     if (remaining > threshold) {
@@ -1030,14 +1030,14 @@ export async function restartSession(sessionId: number): Promise<{ ok: boolean; 
   }
 }
 
-// Manual switch to the account with the most remaining GPU hours.
+// Manual switch to the NEXT account in the rotation order with ≥1.5h GPU left.
 export async function switchSessionNow(sessionId: number): Promise<{ ok: boolean; error?: string; movedTo?: string }> {
   const s = await getSession(sessionId);
   if (!s) return { ok: false, error: "session not found" };
   const account = await getAccount(s.account_id);
   if (!account) return { ok: false, error: "account missing" };
-  const target = await bestSwitchTarget(account.id);
-  if (!target) return { ok: false, error: "no other account with ≥1.5h GPU remaining" };
+  const target = await rotationSwitchTarget(account.id, await switchThreshold());
+  if (!target) return { ok: false, error: `no other account with ≥${(await switchThreshold()).toFixed(1)}h GPU remaining` };
   try {
     const slugName = s.slug.split("/").pop()!;
     if (s.type === "plexus") {

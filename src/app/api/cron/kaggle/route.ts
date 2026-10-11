@@ -17,7 +17,9 @@ export async function GET(req: Request) {
   if (!ok) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
-  await refreshAllQuotas().catch(() => {});
+  // Force-refresh quota snapshots from Kaggle every tick so the UI never shows
+  // stale "hours left" and switch decisions use live numbers.
+  await refreshAllQuotas(true).catch(() => {});
   await watchKaggle().catch(() => {});
   await runAutoSwitcher().catch(() => {});
   return NextResponse.json({ ok: true });

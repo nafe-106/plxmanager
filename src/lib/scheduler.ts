@@ -45,7 +45,7 @@ async function keysJob(): Promise<void> {
 }
 
 async function kaggleJob(): Promise<void> {
-  await refreshAllQuotas();
+  await refreshAllQuotas(true);
   await watchKaggle();
   await runAutoSwitcher();
 }

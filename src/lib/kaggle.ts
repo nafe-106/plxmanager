@@ -903,6 +903,12 @@ async function performSwitchForSession(
     });
     await eventLog(s.id, target.id, s.status, "switched", `${reason} → ${target.username}`);
     await deleteRows("settings", { key: "switch_attempt_" + s.id });
+    // Refresh both accounts right after the move so the cards show live quotas
+    // immediately instead of the snapshot the switch decision was made from.
+    await Promise.allSettled([
+      refreshAccountQuota(account.id, true),
+      refreshAccountQuota(target.id, true),
+    ]);
     void sendAlert({
       kind: "session_switched",
       title: `Kaggle session switched to a fresh account — ${s.label || s.slug}`,

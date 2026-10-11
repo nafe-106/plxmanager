@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button, Card, Empty, PlexusBadge, Progress, Stat, StatusBadge, formatTs } from "./ui";
+import { formatHours } from "@/lib/kaggle";
 
 interface Account {
   id: number;
@@ -222,7 +223,7 @@ export default function KaggleManager() {
             <Stat
               label="GPU used / quota"
               value={`${(overview?.gpuUsedHours ?? 0).toFixed(1)} / ${(overview?.gpuQuotaHours ?? 0).toFixed(1)}h`}
-              sub={`${overview?.gpuReservedHours ? `${overview.gpuReservedHours.toFixed(1)}h held · ` : ""}${((overview?.gpuQuotaHours ?? 0) - (overview?.gpuUsedHours ?? 0)).toFixed(1)}h left`}
+              sub={`${overview?.gpuReservedHours ? `${overview.gpuReservedHours.toFixed(1)}h held · ` : ""}${formatHours((overview?.gpuQuotaHours ?? 0) - (overview?.gpuUsedHours ?? 0))} left`}
             />
             <Stat label="Sessions running" value={overview?.running ?? 0} tone="green" />
             <Stat label="Dead sessions" value={overview?.dead ?? 0} tone={overview?.dead ? "red" : "default"} />
@@ -260,7 +261,7 @@ export default function KaggleManager() {
                           <div className="mb-1 flex items-center justify-between text-[11px] text-zinc-500">
                             <span title="Reserved = kept aside for the running session; released back when it stops.">{apiQuota ? `GPU used ${used}h · ${(a.quota_reserved_h ?? 0).toFixed(1)}h held` : `Used ${used}h (local)`}</span>
                             <span className={usedPct >= 90 ? "text-red-400" : usedPct >= 70 ? "text-amber-300" : "text-emerald-400"}>
-                            {(a.available_hours ?? a.remaining_hours).toFixed(1)}h left
+                            {formatHours(a.available_hours ?? a.remaining_hours)} left
                           </span>
                           </div>
                           <Progress pct={usedPct} />
@@ -713,7 +714,7 @@ function StartSessionForm({
         <Field label="Account *">
           <select className={inputCls} value={accountId} onChange={(e) => setAccountId(e.target.value)} required>
             {accounts.filter((a) => !a.disabled).map((a) => (
-              <option key={a.id} value={a.id}>{a.label} (@{a.username}) — {a.remaining_hours}h GPU left</option>
+              <option key={a.id} value={a.id}>{a.label} (@{a.username}) — {formatHours(a.remaining_hours)} GPU left</option>
             ))}
           </select>
         </Field>

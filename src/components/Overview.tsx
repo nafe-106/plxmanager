@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card, Empty, ProviderBadge, Stat } from "./ui";
+import { formatHours } from "@/lib/kaggle";
 
 interface OverviewData {
   providerOptions: { id: string; label: string; color: string }[];
@@ -91,7 +92,7 @@ export default function Overview() {
         <Stat label="Dead" value={data.keys.dead} tone={data.keys.dead ? "red" : "default"} />
         <Stat label="Rate-limited" value={data.keys.rateLimited} tone={data.keys.rateLimited ? "amber" : "default"} />
         <Stat label="Tokens today" value={data.keys.tokensToday.toLocaleString()} />
-        <Stat label="Kaggle GPU left" value={`${data.kaggle.totalRemainingHours}h`} sub={`${data.kaggle.gpuUsedHours}h used of ${data.kaggle.gpuQuotaHours}h`} />
+        <Stat label="Kaggle GPU left" value={formatHours(data.kaggle.totalRemainingHours)} sub={`${data.kaggle.gpuUsedHours}h used of ${data.kaggle.gpuQuotaHours}h`} />
       </div>
 
       <div className="grid gap-3 sm:grid-cols-2">

@@ -1075,6 +1075,17 @@ export function formatDuration(ms: number): string {
   return `${m}m`;
 }
 
+// Format a decimal hour amount as "Xh Ym" (e.g. 6.25 → "6h 15m").
+export function formatHours(h: number): string {
+  if (!Number.isFinite(h) || h <= 0) return "0m";
+  const totalMin = Math.round(h * 60);
+  const hh = Math.floor(totalMin / 60);
+  const mm = totalMin % 60;
+  if (hh > 0 && mm > 0) return `${hh}h ${mm}m`;
+  if (hh > 0) return `${hh}h`;
+  return `${mm}m`;
+}
+
 export async function kaggleOverview() {
   const accounts = await rows<KaggleAccountRow>("kaggle_accounts", { disabled: 0 });
   const sessions = await rows<KaggleSessionRow>("kaggle_sessions", { paused: 0 });

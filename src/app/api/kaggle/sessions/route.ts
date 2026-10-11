@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { rows, insertRow } from "@/lib/store";
-import { getAccount, getSession, gpuRemainingHours, formatDuration, sessionRunDurationMs, kaggleOverview } from "@/lib/kaggle";
+import { getAccount, getSession, gpuRemainingHours, sessionRunDurationMs, kaggleOverview } from "@/lib/kaggle";
+import { formatDuration } from "@/lib/format";
 
 export async function GET() {
   const g = await guard();

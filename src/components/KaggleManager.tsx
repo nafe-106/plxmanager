@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button, Card, Empty, PlexusBadge, Progress, Stat, StatusBadge, formatTs } from "./ui";
-import { formatHours } from "@/lib/kaggle";
+import { formatHours } from "@/lib/format";
 
 interface Account {
   id: number;

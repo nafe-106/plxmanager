@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Card, Empty, ProviderBadge, Stat } from "./ui";
-import { formatHours } from "@/lib/kaggle";
+import { formatHours } from "@/lib/format";
 
 interface OverviewData {
   providerOptions: { id: string; label: string; color: string }[];

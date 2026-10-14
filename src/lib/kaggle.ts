@@ -803,16 +803,29 @@ export async function watchSession(session: KaggleSessionRow): Promise<void> {
   const prev = session.status;
   const prevRunningSince = session.running_since;
 
-  // GPU accounting + state transitions
+  // GPU accounting + state transitions.
+  // Accrue the interval since the previous poll (using last_checked_at as the
+  // baseline) rather than resetting running_since each tick — otherwise the
+  // uptime display always reads "running 0m".
+  const accruedSince = (fallback: string | null): string | null => {
+    if (session.last_checked_at && fallback && Date.parse(session.last_checked_at) > Date.parse(fallback)) {
+      return session.last_checked_at;
+    }
+    return fallback;
+  };
   if (next === "running") {
-    if (prevRunningSince) {
-      const elapsed = (now.getTime() - Date.parse(prevRunningSince)) / 1000;
-      await addGpuSeconds(account.id, elapsed, tz, account.week_reset_day);
+    if (prev === "running" && prevRunningSince) {
+      const base = accruedSince(prevRunningSince) || prevRunningSince;
+      const elapsed = (now.getTime() - Date.parse(base)) / 1000;
+      if (elapsed > 0 && elapsed < 3600) await addGpuSeconds(account.id, elapsed, tz, account.week_reset_day);
     }
     await updateRow("kaggle_sessions", session.id, {
       status: "running",
       status_detail: "",
-      running_since: iso(now),
+      running_since:
+        prev === "running"
+          ? session.status_changed_at || prevRunningSince || iso(now)
+          : iso(now),
       dead: 0,
       dead_at: null,
       status_changed_at: prev === "running" ? session.status_changed_at : iso(now),
@@ -821,8 +834,9 @@ export async function watchSession(session: KaggleSessionRow): Promise<void> {
     if (prev !== "running") await eventLog(session.id, account.id, prev, "running", "session now running");
   } else {
     if (prevRunningSince) {
-      const elapsed = (now.getTime() - Date.parse(prevRunningSince)) / 1000;
-      await addGpuSeconds(account.id, elapsed, tz, account.week_reset_day);
+      const base = accruedSince(prevRunningSince) || prevRunningSince;
+      const elapsed = (now.getTime() - Date.parse(base)) / 1000;
+      if (elapsed > 0 && elapsed < 3600) await addGpuSeconds(account.id, elapsed, tz, account.week_reset_day);
       await updateRow("kaggle_sessions", session.id, { running_since: null });
     }
     if (next !== prev) {

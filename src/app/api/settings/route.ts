@@ -4,6 +4,7 @@ import { getAllSettings, setSetting, updateSettings, SETTING_DEFAULTS } from "@/
 import { hashPassword } from "@/lib/crypto";
 import { row, deleteRows } from "@/lib/store";
 import { restartSchedulerJobs } from "@/lib/scheduler";
+import { signalPlexusToken, signalPlexusStop } from "@/lib/kaggle";
 
 const SECRET_KEYS = [
   "telegram_bot_token",
@@ -60,6 +61,12 @@ export async function PUT(req: Request) {
     }
   }
   await updateSettings(patch);
+
+  // Rotating the Plexus token must make any kernel still running the OLD token
+  // (embedded at push time) terminate itself, or it bleeds GPU hours forever.
+  if (patch.plexus_token) {
+    void signalPlexusToken(patch.plexus_token).catch(() => {});
+  }
 
   if (body.admin_password && typeof body.admin_password === "string" && body.admin_password.trim()) {
     await setSetting("admin_password_hash", hashPassword(body.admin_password.trim()));

@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { rows, insertRow } from "@/lib/store";
-import { getAccount, getSession, gpuRemainingHours, sessionRunDurationMs, kaggleOverview } from "@/lib/kaggle";
+import { getAccount, getSession, gpuRemainingHours, sessionRunDurationMs, kaggleOverview, refreshAllQuotas } from "@/lib/kaggle";
 import { formatDuration } from "@/lib/format";
 
 export async function GET() {
   const g = await guard();
   if (g) return g;
+  await refreshAllQuotas().catch(() => {});
   const all = await rows<any>("kaggle_sessions", {}, { order: "id", asc: false });
   const sessions = [];
   for (const s of all) {

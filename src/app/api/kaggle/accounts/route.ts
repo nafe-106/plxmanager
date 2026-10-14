@@ -2,11 +2,12 @@ import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { rows, insertRow } from "@/lib/store";
 import { encrypt } from "@/lib/crypto";
-import { getAccount, gpuUsedHoursThisWeek, gpuRemainingHours, dailyGpuHistory } from "@/lib/kaggle";
+import { getAccount, gpuUsedHoursThisWeek, gpuRemainingHours, dailyGpuHistory, refreshAllQuotas } from "@/lib/kaggle";
 
 export async function GET() {
   const g = await guard();
   if (g) return g;
+  await refreshAllQuotas().catch(() => {});
   const all = await rows<any>("kaggle_accounts", {}, { order: "id" });
   const accounts = [];
   for (const a of all) {

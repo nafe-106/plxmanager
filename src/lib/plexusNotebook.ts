@@ -56,6 +56,8 @@ SUPABASE_URL = "__PLEXUS_SUPABASE_URL__"
 SUPABASE_KEY = "__PLEXUS_SUPABASE_KEY__"
 PUBLISH_ENABLED = bool(SUPABASE_URL and SUPABASE_KEY)
 
+START_MS = int(time.time() * 1000)
+
 OLLAMA_HOST = "127.0.0.1:11434"
 
 PROXY_HOST = "127.0.0.1"
@@ -944,6 +946,97 @@ def publish_connection(url):
 
 
 # ============================================================
+# STOP SIGNAL
+#
+# Target API Manager writes a control value into the row id=2 of
+# plexus_endpoint (column public_url):
+#   "stop:<ms>"   -> explicit stop requested (halt the run, free the GPU)
+#   "token:<tx>"  -> current expected Plexus token; a stale kernel (from a
+#                    previous rotation) sees a mismatch and halts itself.
+# We read it on a short poll and end the run when honored.
+# ============================================================
+
+def read_control():
+
+    if not PUBLISH_ENABLED:
+        return ""
+
+    try:
+
+        request = urllib.request.Request(
+            SUPABASE_URL
+            + "/rest/v1/plexus_endpoint?id=eq.2&select=public_url",
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Accept": "application/json",
+            },
+        )
+
+        with urllib.request.urlopen(
+            request,
+            timeout=10
+        ) as response:
+
+            data = json.loads(
+                response.read().decode()
+            )
+
+        if isinstance(data, list) and data:
+
+            return str(
+                data[0].get("public_url", "") or ""
+            )
+
+    except Exception as e:
+
+        print("Control read failed:", e)
+
+    return ""
+
+
+def honoured_stop():
+
+    value = read_control()
+
+    if not value:
+        return False
+
+    try:
+
+        if value.startswith("stop:"):
+
+            return int(value[5:]) > START_MS
+
+        if value.startswith("token:"):
+
+            return value[6:] != PLEXUS_TOKEN
+
+    except Exception:
+        pass
+
+    return False
+
+
+def release_gpu():
+
+    print()
+    print(
+        "STOP SIGNAL RECEIVED - "
+        "releasing GPU and ending run."
+    )
+    print()
+
+    kill_named_process("cloudflared")
+
+    kill_process(
+        STATE.get("cloudflared")
+    )
+
+    os._exit(0)
+
+
+# ============================================================
 # FINAL VERIFICATION
 # ============================================================
 
@@ -1129,7 +1222,15 @@ print()
 print("Parking main thread (run stays alive).")
 
 while True:
-    time.sleep(300)
+    time.sleep(30)
+
+    try:
+
+        if honoured_stop():
+            release_gpu()
+
+    except Exception:
+        pass
 
     url = STATE.get("public_url")
 
@@ -1153,7 +1254,7 @@ export interface PlexusNotebookOptions {
 export function renderPlexusNotebook(opts: PlexusNotebookOptions): string {
   return PLEXUS_NOTEBOOK.replace(/__PLEXUS_SUPABASE_URL__/g, opts.supabaseUrl || "")
     .replace(/__PLEXUS_SUPABASE_KEY__/g, opts.supabaseKey || "")
-    .replace(/__PLEXUS_TOKEN__/g, opts.plexusToken || "PLEXUS_KAGGLE_2026")
+    .replace(/__PLEXUS_TOKEN__/g, opts.plexusToken || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c")
     .replace(/__BRAIN_MODEL__/g, opts.brainModel || DEFAULT_BRAIN_MODEL)
     .replace(/__VISION_MODEL__/g, opts.visionModel || DEFAULT_VISION_MODEL)
     .replace(/__EXTRA_MODELS__/g, JSON.stringify(opts.extraModels?.filter(Boolean) || []));

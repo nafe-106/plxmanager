@@ -1,4 +1,4 @@
-import { byId, row, rows, insertRow, updateRow, deleteRows, upsertRows, nowSql } from "./store";
+import { byId, row, rows, insertRow, updateRow, deleteRows, upsertRows, nowSql, supabase } from "./store";
 import { decrypt, encrypt } from "./crypto";
 import { getSetting, setSetting, getAllSettings, timezone } from "./settings";
 import { sendAlert } from "./alerts";
@@ -153,7 +153,16 @@ async function kaggleRequest(
 }
 
 async function kagglePost(account: KaggleAccountRow, path: string, body: unknown): Promise<any> {
-  return kaggleRequest(account, path, body);
+  const j = await kaggleRequest(account, path, body);
+  // Kaggle reports push rejections as 200-with-error-body (e.g. a GPU session
+  // cap or title conflict). Surface them as real failures instead of letting
+  // callers treat an empty ref as success.
+  if (path === "/kernels/push" && j && typeof j === "object") {
+    const msg = j.error || j.errorNullable || "";
+    if (j.hasError === true && msg) throw new Error(msg);
+    if (j.error && (j.error as string).length) throw new Error(j.error as string);
+  }
+  return j;
 }
 
 async function kaggleGet(account: KaggleAccountRow, path: string): Promise<any> {
@@ -188,7 +197,7 @@ function quotaSeconds(value: unknown): number {
   return 0;
 }
 
-const QUOTA_REFRESH_COOLDOWN_MS = 10 * 60 * 1000;
+const QUOTA_REFRESH_COOLDOWN_MS = 60 * 1000;
 const QUOTA_FRESH_MS = 12 * 60 * 60 * 1000;
 
 export async function fetchQuota(account: KaggleAccountRow): Promise<{
@@ -407,10 +416,35 @@ export async function createKernelFromScript(
   script: string,
   opts: CreateKernelFromScriptOptions
 ): Promise<any> {
+  const desiredTitle = opts.title || opts.slugName.split("-").join(" ");
+
+  // Kaggle enforces a per-user unique kernel title and rejects a push that
+  // would collide with an existing notebook (HTTP 409). If a notebook already
+  // exists for this slug OR title, reuse its numeric id so the push updates and
+  // re-runs it instead of failing on the duplicate title.
+  let id: number | null = null;
+  let slug = opts.slugName;
+  try {
+    const slugOf = (ref: string) =>
+      ref.includes("/") ? ref.slice(ref.indexOf("/") + 1) : ref;
+    const existing = (await listAccountNotebooks(account)).find(
+      (k) => slugOf(k.ref) === opts.slugName || (!!desiredTitle && k.title === desiredTitle)
+    );
+    if (existing) {
+      const pulled = await pullKernel(account, existing.ref);
+      if (pulled?.metadata?.id != null) {
+        id = Number(pulled.metadata.id);
+        slug = slugOf(existing.ref) || opts.slugName;
+      }
+    }
+  } catch {
+    /* listing/pull failed — fall through and attempt a fresh create */
+  }
+
   const request: Record<string, any> = {
-    id: null,
-    slug: `${account.username}/${opts.slugName}`,
-    newTitle: opts.title || opts.slugName.split("-").join(" "),
+    id,
+    slug,
+    newTitle: desiredTitle,
     text: script,
     language: "python",
     kernelType: "script",
@@ -479,15 +513,17 @@ export async function startPlexusSession(
 
   // Re-use an existing (not dead) plexus row for this account+slug.
   const fullSlug = `${account.username}/${slugName}`;
-  const existing = await row<{ id: number }>("kaggle_sessions", {
+  // Reuse an existing live plexus session for this account. A stopped (but not
+  // dead) session is re-pushed below so "Start" actually resumes it, rather
+  // than being blocked as "already running".
+  const existingRows = await rows<KaggleSessionRow>("kaggle_sessions", {
     account_id: accountId,
-    slug: fullSlug,
     type: "plexus",
-    paused: 0,
     dead: 0,
   });
-  if (existing) {
-    return { ok: true, id: existing.id, slug: fullSlug, error: "already running" };
+  const existing = existingRows[0] || null;
+  if (existing && (existing.status === "queued" || existing.status === "running")) {
+    return { ok: true, id: existing.id, slug: existing.slug, error: "already running" };
   }
 
   const [
@@ -507,7 +543,7 @@ export async function startPlexusSession(
   ]);
   const supabaseUrl = supabaseUrlRaw || "";
   const supabaseKey = supabaseKeyRaw || "";
-  const plexusToken = plexusTokenRaw || "PLEXUS_KAGGLE_2026";
+  const plexusToken = plexusTokenRaw || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c";
   const brainModel = brainModelRaw || DEFAULT_BRAIN_MODEL;
   const visionModel = visionModelRaw || DEFAULT_VISION_MODEL;
   const extraModels = Array.isArray(opts.extraModels)
@@ -530,17 +566,33 @@ export async function startPlexusSession(
     });
     const slug = pushed?.ref || fullSlug;
     const now = iso(new Date());
-    const inserted = await insertRow<KaggleSessionRow>("kaggle_sessions", {
-      account_id: accountId,
-      slug,
-      label: (opts.label || "Plexus GPU server").slice(0, 200),
-      type: "plexus",
-      status: "queued",
-      status_changed_at: now,
-      auto_switch: 1,
-    });
-    const id = Number(inserted.id);
-    await eventLog(id, accountId, "", "queued", `started via push (${slug})`);
+    let id: number;
+    if (existing) {
+      // Re-run the existing watched session rather than creating a duplicate.
+      await updateRow("kaggle_sessions", existing.id, {
+        slug,
+        label: (opts.label || existing.label || "Plexus GPU server").slice(0, 200),
+        status: "queued",
+        status_changed_at: now,
+        dead: 0,
+        dead_at: null,
+        last_checked_at: now,
+      });
+      id = existing.id;
+    } else {
+      const inserted = await insertRow<KaggleSessionRow>("kaggle_sessions", {
+        account_id: accountId,
+        slug,
+        label: (opts.label || "Plexus GPU server").slice(0, 200),
+        type: "plexus",
+        status: "queued",
+        status_changed_at: now,
+        auto_switch: 1,
+      });
+      id = Number(inserted.id);
+    }
+    await eventLog(id, accountId, existing?.status || "", "queued", `started via push (${slug})`);
+    await signalPlexusToken(plexusToken).catch(() => {});
     return { ok: true, id, slug };
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) };
@@ -659,8 +711,37 @@ export async function fetchPlexusUrl(): Promise<string | null> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Plexus remote-stop channel
+//
+// Row id=2 of `plexus_endpoint` carries a control value that running Plexus
+// notebooks poll (~30s):
+//   "stop:<ms>"   → explicit stop (frees the GPU by ending the run)
+//   "token:<tx>"  → the expected token; stale kernels detect the mismatch and
+//                   halt themselves after a token rotation
+// Written with the service role (bypasses RLS); the notebook only reads it.
+// ---------------------------------------------------------------------------
+export async function writePlexusControl(value: string): Promise<void> {
+  try {
+    await supabase().from("plexus_endpoint").upsert(
+      { id: 2, public_url: value },
+      { onConflict: "id" }
+    );
+  } catch {
+    /* best effort — a failing control write must not break the caller */
+  }
+}
+
+export async function signalPlexusStop(): Promise<void> {
+  await writePlexusControl(`stop:${Date.now()}`);
+}
+
+export async function signalPlexusToken(token: string): Promise<void> {
+  await writePlexusControl(`token:${token || ""}`);
+}
+
 export async function checkPlexusEndpoint(url: string): Promise<{ ok: boolean; error?: string; ms?: number }> {
-  const token = (await getSetting("plexus_token")) || "PLEXUS_KAGGLE_2026";
+  const token = (await getSetting("plexus_token")) || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c";
   const started = Date.now();
   try {
     const res = await fetch(`${url.replace(/\/+$/, "")}/api/tags`, {
@@ -997,7 +1078,7 @@ async function pushBundledPlexus(
   const script = renderPlexusNotebook({
     supabaseUrl: supabaseUrlRaw || "",
     supabaseKey: supabaseKeyRaw || "",
-    plexusToken: plexusTokenRaw || "PLEXUS_KAGGLE_2026",
+    plexusToken: plexusTokenRaw || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c",
     brainModel: brainModelRaw || DEFAULT_BRAIN_MODEL,
     visionModel: visionModelRaw || DEFAULT_VISION_MODEL,
     extraModels: parseExtraModels(extraModelsRaw),
@@ -1006,6 +1087,9 @@ async function pushBundledPlexus(
     slugName,
     title: title || "Plexus Ollama GPU Server",
   });
+  // Declare the expected token for this bundle so any stale kernel running a
+  // previous token sees the mismatch and halts itself (and clears a stop).
+  await signalPlexusToken(plexusTokenRaw || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c").catch(() => {});
 }
 
 // Manual restart (re-run on the same account).

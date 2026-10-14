@@ -13,7 +13,7 @@ import { getSetting } from "@/lib/settings";
 
 async function tokenOk(val: unknown): Promise<boolean> {
   if (!val) return false;
-  const expected = (await getSetting("plexus_token")) || "PLEXUS_KAGGLE_2026";
+  const expected = (await getSetting("plexus_token")) || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c";
   const bearer = process.env.USAGE_LOG_BEARER || "";
   return String(val) === expected || String(val) === bearer;
 }

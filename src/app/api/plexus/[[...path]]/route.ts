@@ -31,7 +31,7 @@ async function currentTunnelUrl(): Promise<string | null> {
 }
 
 async function authed(req: Request): Promise<boolean> {
-  const expected = (await getSetting("plexus_token")) || "PLEXUS_KAGGLE_2026";
+  const expected = (await getSetting("plexus_token")) || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c";
   const query = new URL(req.url).searchParams.get("token");
   if (query && query === expected) return true;
   const bearer = req.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
@@ -56,7 +56,7 @@ async function handler(
   const query = new URL(req.url).searchParams.toString();
   const target = `${base}${pathname}${query ? "?" + query : ""}`;
 
-  const token = (await getSetting("plexus_token")) || "PLEXUS_KAGGLE_2026";
+  const token = (await getSetting("plexus_token")) || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c";
   const hasBody = req.method !== "GET" && req.method !== "HEAD";
   let body: BodyInit | undefined = hasBody ? await req.arrayBuffer() : undefined;
 

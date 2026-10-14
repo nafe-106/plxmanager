@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { byId, updateRow, deleteRows, nowSql } from "@/lib/store";
+import { signalPlexusStop } from "@/lib/kaggle";
 
 export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }> }) {
   const g = await guard();
@@ -35,6 +36,13 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
 
   patch.updated_at = nowSql();
   await updateRow("kaggle_sessions", sessionId, patch);
+
+  // Pausing a plexus session only stops our polling — the Kaggle GPU run keeps
+  // burning hours. Signal the running kernel to end itself so the GPU is freed.
+  if (patch.paused === 1 && session.type === "plexus") {
+    void signalPlexusStop().catch(() => {});
+  }
+
   return NextResponse.json({ ok: true });
 }
 

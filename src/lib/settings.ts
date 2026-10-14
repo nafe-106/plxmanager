@@ -14,7 +14,7 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   alert_webhook_url: "",
   plexus_supabase_url: "",
   plexus_supabase_key: "",
-  plexus_token: "PLEXUS_KAGGLE_2026",
+  plexus_token: "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c",
   plexus_auto_switch: "1",
   plexus_switch_threshold_h: "0.5",
   plexus_brain_model: "qwen3:30b",
@@ -29,7 +29,7 @@ const ENV_FALLBACK: Partial<Record<string, () => string | undefined>> = {
     process.env.PLEXUS_SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || "",
   plexus_supabase_key: () =>
     process.env.PLEXUS_SUPABASE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "",
-  plexus_token: () => process.env.PLEXUS_TOKEN || "PLEXUS_KAGGLE_2026",
+  plexus_token: () => process.env.PLEXUS_TOKEN || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c",
 };
 
 export async function getSetting(key: string): Promise<string | null> {

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
 import { rows, insertRow } from "@/lib/store";
-import { getAccount, getSession, gpuRemainingHours, sessionRunDurationMs, kaggleOverview, refreshAllQuotas } from "@/lib/kaggle";
+import { getAccount, getSession, getPlexusMode, gpuRemainingHours, sessionRunDurationMs, kaggleOverview, refreshAllQuotas } from "@/lib/kaggle";
 import { formatDuration } from "@/lib/format";
 
 export async function GET() {
@@ -12,10 +12,22 @@ export async function GET() {
   const sessions = [];
   for (const s of all) {
     const account = s.account_id ? await getAccount(s.account_id) : null;
+    const remaining = account ? await gpuRemainingHours(account) : null;
+    const mode = s.type === "plexus" ? await getPlexusMode(s.id) : null;
+    // Prefer the mode recorded at push time; fall back to "account is out of
+    // GPU" for sessions started before mode tracking existed.
+    const noGpu =
+      s.type === "plexus" &&
+      s.status === "running" &&
+      (mode === "cpu" || (mode === null && remaining !== null && remaining <= 0));
     sessions.push({
       ...s,
       duration: s.running_since ? formatDuration(sessionRunDurationMs(s as any) || 0) : null,
       account: account ? { id: account.id, label: account.label, username: account.username } : null,
+      account_remaining_h: remaining,
+      gpu_mode: mode,
+      // Running without a GPU = CPU fallback.
+      no_gpu: noGpu,
     });
   }
   return NextResponse.json({ sessions, overview: await kaggleOverview() });

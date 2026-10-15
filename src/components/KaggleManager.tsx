@@ -44,6 +44,8 @@ interface Session {
   plexus_error: string;
   duration: string | null;
   account: { id: number; label: string; username: string } | null;
+  account_remaining_h: number | null;
+  no_gpu: boolean;
 }
 
 interface Overview {
@@ -321,6 +323,14 @@ export default function KaggleManager() {
                         {s.type === "plexus" && (
                           <span className="rounded bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-300 ring-1 ring-violet-500/30">
                             Plexus GPU server
+                          </span>
+                        )}
+                        {s.no_gpu && (
+                          <span
+                            className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-amber-500/30"
+                            title="Running on CPU — this account has no GPU hours left. The endpoint stays alive without a GPU."
+                          >
+                            running without GPU (CPU)
                           </span>
                         )}
                         {s.paused ? (

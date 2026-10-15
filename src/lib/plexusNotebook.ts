@@ -14,8 +14,11 @@
 //   __BRAIN_MODEL__ / __VISION_MODEL__ / __EXTRA_MODELS__
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_BRAIN_MODEL = "qwen3:30b";
-export const DEFAULT_VISION_MODEL = "qwen2.5vl:7b";
+export const DEFAULT_BRAIN_MODEL = "qwen3:8b";
+
+// Off for now: we're testing the 8B brain only. Set the `plexus_vision_model`
+// setting (or pass visionModel) to bring the vision model back.
+export const DEFAULT_VISION_MODEL = "";
 export const DEFAULT_EXTRA_MODELS: string[] = [];
 export const DEFAULT_SLUG = "plexus-ollama";
 
@@ -23,8 +26,8 @@ export const PLEXUS_NOTEBOOK = String.raw`# ====================================
 # PLEXUS - KAGGLE GPU OLLAMA + AUTH PROXY + CLOUDFLARE
 # KEEP-ALIVE (publishes the tunnel URL to Supabase)
 #
-# Brain  : qwen3:30b
-# Vision : qwen2.5vl:7b
+# Brain  : __BRAIN_MODEL__
+# Vision : __VISION_MODEL__
 # ============================================================
 
 import os
@@ -82,12 +85,23 @@ LOCK = threading.Lock()
 # HELPERS
 # ============================================================
 
+class _MissingResult:
+    returncode = 127
+    stdout = ""
+    stderr = "command not found"
+
+
 def run(cmd, capture=True):
-    return subprocess.run(
-        cmd,
-        capture_output=capture,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=capture,
+            text=True,
+        )
+    except FileNotFoundError:
+        # Binary absent (e.g. nvidia-smi on a CPU-only run). Return a non-zero
+        # result instead of crashing so the boot can continue without a GPU.
+        return _MissingResult()
 
 
 def port_open(host, port):
@@ -345,11 +359,16 @@ def ensure_model(model):
     print(f"OK {model}")
 
 
+# Brain always. Vision + extras are opt-in (empty by default while we test
+# the 8B brain only) so the boot is fast on CPU too.
 ensure_model(BRAIN_MODEL)
-ensure_model(VISION_MODEL)
+
+if VISION_MODEL:
+    ensure_model(VISION_MODEL)
 
 for model in EXTRA_MODELS:
-    ensure_model(model)
+    if model:
+        ensure_model(model)
 
 
 # ============================================================

@@ -442,8 +442,6 @@ export async function createKernelFromScript(
   }
 
   const request: Record<string, any> = {
-    id,
-    slug,
     newTitle: desiredTitle,
     text: script,
     language: "python",
@@ -458,7 +456,40 @@ export async function createKernelFromScript(
     userKeywords: [],
     categoryIds: [],
   };
+  // Kaggle rejects a bare `slug` when CREATING a kernel ("Invalid slug"). For an
+  // existing kernel we update by id+slug; for a brand-new one we must send `ref`
+  // (owner/name) instead and let Kaggle mint the slug from it.
+  if (id != null) {
+    request.id = id;
+    request.slug = slug;
+  } else {
+    request.ref = `${account.username}/${slug}`;
+  }
   return kagglePost(account, "/kernels/push", request);
+}
+
+// Push a kernel, retrying with progressively more unique titles when Kaggle
+// rejects the title (409). Kaggle keeps the titles of previously deleted
+// notebooks reserved, so even a slug-qualified title can collide; the final
+// attempt adds a random suffix. Reuse across restarts is by slug (the ref), not
+// by title, so a one-off unique title is safe.
+async function createKernelWithTitleRetry(
+  account: KaggleAccountRow,
+  script: string,
+  opts: { slugName: string; title: string; enableGpu?: boolean }
+): Promise<any> {
+  const rand = Math.random().toString(36).slice(2, 6);
+  const candidates = [opts.title, `${opts.title} ${opts.slugName}`, `${opts.title} ${opts.slugName} ${rand}`];
+  let lastErr: any;
+  for (let i = 0; i < candidates.length; i++) {
+    try {
+      return await createKernelFromScript(account, script, { ...opts, title: candidates[i] });
+    } catch (err: any) {
+      lastErr = err;
+      if (!/title/i.test(err?.message || "")) throw err;
+    }
+  }
+  throw lastErr;
 }
 
 export interface StartPlexusSessionOptions {
@@ -468,6 +499,8 @@ export interface StartPlexusSessionOptions {
   brainModel?: string;
   visionModel?: string;
   extraModels?: string[] | string;
+  /** Force GPU on/off instead of deriving it from remaining quota. */
+  enableGpu?: boolean;
 }
 
 // Parse a user-provided model list ("qwen3:8b, llamma3.1:8b" / newlines /
@@ -496,12 +529,11 @@ export async function startPlexusSession(
 
   const remaining = await gpuRemainingHours(account);
   const threshold = parseFloat((await getSetting("plexus_switch_threshold_h")) || "1.5");
-  if (remaining <= threshold) {
-    return {
-      ok: false,
-      error: `Account ${account.username} is near exhaustion (${remaining.toFixed(2)}h GPU left). Switch or pick another account first.`,
-    };
-  }
+  // CPU fallback: with no GPU hours left we still start the Plexus server on
+  // CPU so the endpoint stays alive (instead of refusing to start). The manager
+  // shows it as "running without GPU". Pass enableGpu to override (e.g. to
+  // force a GPU start for testing the GPU→CPU auto-switch).
+  const enableGpu = opts.enableGpu ?? remaining > threshold;
 
   const slugName =
     (opts.slugName || DEFAULT_SLUG)
@@ -559,11 +591,33 @@ export async function startPlexusSession(
     extraModels,
   });
 
+  const title = opts.title || "Plexus Ollama GPU Server";
   try {
-    const pushed = await createKernelFromScript(account, script, {
-      slugName,
-      title: opts.title || "Plexus Ollama GPU Server",
-    });
+    let usedGpu = enableGpu;
+    let pushed: any;
+    try {
+      pushed = await createKernelWithTitleRetry(account, script, { slugName, title, enableGpu });
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      // "try GPU first, fall back to CPU": Kaggle rejects a GPU push once the
+      // account's weekly GPU quota is spent ("Maximum weekly GPU quota ...").
+      // Start it on CPU instead of failing, so the endpoint stays alive.
+      if (usedGpu && /quota/i.test(msg)) {
+        pushed = await createKernelWithTitleRetry(account, script, { slugName, title, enableGpu: false });
+        usedGpu = false;
+        void sendAlert({
+          kind: "session_switched",
+          title: `Plexus started WITHOUT GPU (CPU fallback)${opts.label ? " — " + opts.label : ""}`,
+          lines: [
+            `GPU unavailable: ${msg}`,
+            `Account: ${account.username}`,
+            "Running on CPU so the endpoint stays alive; will move back to GPU after the weekly reset.",
+          ],
+        });
+      } else {
+        throw err;
+      }
+    }
     const slug = pushed?.ref || fullSlug;
     const now = iso(new Date());
     let id: number;
@@ -591,8 +645,9 @@ export async function startPlexusSession(
       });
       id = Number(inserted.id);
     }
-    await eventLog(id, accountId, existing?.status || "", "queued", `started via push (${slug})`);
+    await eventLog(id, accountId, existing?.status || "", "queued", `started via push (${slug})${usedGpu ? "" : " [CPU]"}`);
     await signalPlexusToken(plexusToken).catch(() => {});
+    await setPlexusMode(id, usedGpu);
     return { ok: true, id, slug };
   } catch (err: any) {
     return { ok: false, error: err?.message || String(err) };
@@ -740,6 +795,26 @@ export async function signalPlexusToken(token: string): Promise<void> {
   await writePlexusControl(`token:${token || ""}`);
 }
 
+// ---------------------------------------------------------------------------
+// Per-session GPU/CPU mode
+//
+// Recorded in the settings KV when a plexus kernel is pushed so the manager can
+// show "running without GPU" accurately and so the switcher can move a session
+// back onto the GPU once an account's weekly quota resets.
+// ---------------------------------------------------------------------------
+export async function setPlexusMode(sessionId: number, enableGpu: boolean): Promise<void> {
+  try {
+    await setSetting(`plexus_mode_${sessionId}`, enableGpu ? "gpu" : "cpu");
+  } catch {
+    /* best effort */
+  }
+}
+
+export async function getPlexusMode(sessionId: number): Promise<"gpu" | "cpu" | null> {
+  const v = await getSetting(`plexus_mode_${sessionId}`);
+  return v === "cpu" || v === "gpu" ? v : null;
+}
+
 export async function checkPlexusEndpoint(url: string): Promise<{ ok: boolean; error?: string; ms?: number }> {
   const token = (await getSetting("plexus_token")) || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c";
   const started = Date.now();
@@ -831,7 +906,19 @@ export async function watchSession(session: KaggleSessionRow): Promise<void> {
       status_changed_at: prev === "running" ? session.status_changed_at : iso(now),
       last_checked_at: iso(now),
     });
-    if (prev !== "running") await eventLog(session.id, account.id, prev, "running", "session now running");
+    if (prev !== "running") {
+      await eventLog(session.id, account.id, prev, "running", "session now running");
+      void sendAlert({
+        kind: "session_status",
+        title: `Kaggle session running — ${session.label || session.slug}${session.type === "plexus" ? " (Plexus GPU server)" : ""}`,
+        lines: [
+          `Session: ${session.label || session.slug}`,
+          `Status: ${prev || "queued"} → running`,
+          `Account: ${account.username}`,
+          `At: ${iso(now)}`,
+        ],
+      });
+    }
   } else {
     if (prevRunningSince) {
       const base = accruedSince(prevRunningSince) || prevRunningSince;
@@ -849,13 +936,18 @@ export async function watchSession(session: KaggleSessionRow): Promise<void> {
         last_checked_at: iso(now),
       });
       await eventLog(session.id, account.id, prev, next, died ? `went ${next} while it was running` : "");
-      if (died) {
-        void sendAlert({
-          kind: session.type === "plexus" ? "plexus_down" : "session_dead",
-          title: `Kaggle session ${session.label || session.slug} died${session.type === "plexus" ? " (Plexus GPU server)" : ""}`,
-          lines: [`Session: ${session.label || session.slug}`, `Status: running → ${next}`, `Account: ${account.username}`, `At: ${iso(now)}`],
-        });
-      }
+      void sendAlert({
+        kind: died ? (session.type === "plexus" ? "plexus_down" : "session_dead") : "session_status",
+        title: died
+          ? `Kaggle session ${session.label || session.slug} died${session.type === "plexus" ? " (Plexus GPU server)" : ""}`
+          : `Kaggle session ${session.label || session.slug} → ${next}`,
+        lines: [
+          `Session: ${session.label || session.slug}`,
+          `Status: ${prev} → ${next}`,
+          `Account: ${account.username}`,
+          `At: ${iso(now)}`,
+        ],
+      });
     } else {
       await updateRow("kaggle_sessions", session.id, {
         last_checked_at: iso(now),
@@ -948,44 +1040,56 @@ async function performSwitchForSession(
   const remaining = await gpuRemainingHours(account);
   const target = await rotationSwitchTarget(account.id, await switchThreshold());
   if (!target) {
+    // No other account has GPU hours. Keep the Plexus server ALIVE on this same
+    // account: restartSession pushes it with enableGpu=false when the account is
+    // out of GPU hours (CPU fallback), so the endpoint never goes dark instead
+    // of dying at the limit.
     const threshold = await switchThreshold();
-    if (remaining > threshold) {
-      // No other account has quota to switch to, but this one still does —
-      // restart the session in place instead of leaving it dead.
-      const res = await restartSession(s.id);
-      if (!res.ok) {
-        void sendAlert({
-          kind: "session_dead",
-          title: `Auto-restart failed — ${s.label || s.slug}`,
-          lines: [`Error: ${res.error || "unknown"}`, `Session: ${s.label || s.slug}`],
-        });
-        return { ok: false, error: res.error || "restart failed" };
-      }
-      await eventLog(s.id, account.id, s.status, "restart", "auto-restart (no switch target, same account has quota)");
+    const cpuMode = remaining <= threshold;
+    const res = await restartSession(s.id);
+    if (!res.ok) {
       void sendAlert({
-        kind: "session_switched",
-        title: `Auto-restarted ${s.label || s.slug} on the same account`,
-        lines: [
-          "Reason: no other account available",
-          `Account: ${account.username} (${remaining.toFixed(1)}h GPU left)`,
-          `New kernel: ${res.slug || s.slug}`,
-          "The Plexus bootstrap will publish the new tunnel URL automatically.",
-        ],
+        kind: "session_dead",
+        title: `Auto-restart failed — ${s.label || s.slug}`,
+        lines: [`Error: ${res.error || "unknown"}`, `Session: ${s.label || s.slug}`],
       });
-      return { ok: true };
+      return { ok: false, error: res.error || "restart failed" };
     }
+    await eventLog(
+      s.id,
+      account.id,
+      s.status,
+      "restart",
+      `auto-restart (no switch target${cpuMode ? ", out of GPU → CPU mode" : ", same account has quota"})`
+    );
     void sendAlert({
-      kind: "session_dead",
-      title: `No Kaggle account available to switch to — ${s.label || s.slug}`,
-      lines: [`Account ${account.username} exhausted (${remaining.toFixed(1)}h left), no other account has ≥1.5h`, `Session: ${s.label || s.slug}`],
+      kind: "session_switched",
+      title: cpuMode
+        ? `Plexus continued WITHOUT GPU (CPU) — ${s.label || s.slug}`
+        : `Auto-restarted ${s.label || s.slug} on the same account`,
+      lines: [
+        cpuMode
+          ? "No Kaggle account has GPU hours left — running on CPU so the endpoint stays alive."
+          : "Reason: no other account available",
+        `Account: ${account.username} (${remaining.toFixed(1)}h GPU left)`,
+        `New kernel: ${res.slug || s.slug}`,
+        "The Plexus bootstrap will publish the new tunnel URL automatically.",
+      ],
     });
-    return { ok: false, error: "no target account available" };
+    return { ok: true };
   }
 
   try {
     const slugName = s.slug.split("/").pop()!;
-    const pulled = await pullKernel(account, s.slug);
-    await pushKernel(target, pulled, slugName);
+    if (s.type === "plexus") {
+      // Re-render the current bundle (carries CPU/GPU mode + token) instead of
+      // re-running a possibly-outdated notebook that's already on Kaggle.
+      const { enableGpu } = await pushBundledPlexus(target, slugName);
+      await setPlexusMode(s.id, enableGpu);
+    } else {
+      const pulled = await pullKernel(account, s.slug);
+      await pushKernel(target, pulled, slugName);
+    }
     const newSlug = `${target.username}/${slugName}`;
     await updateRow("kaggle_sessions", s.id, {
       account_id: target.id,
@@ -1060,6 +1164,11 @@ export async function runAutoSwitcher(): Promise<void> {
   });
 
   for (const s of runningPlexus) {
+    // Already running via CPU (mode recorded at push time): nothing to move here.
+    // Phase C brings it back to the GPU once quota resets. Without this guard an
+    // exhausted account with no GPU target would stop+restart the CPU session on
+    // every cooled-down tick (a pointless restart loop).
+    if ((await getPlexusMode(s.id)) === "cpu") continue;
     const account = await getAccount(s.account_id);
     if (!account) continue;
     const remaining = await gpuRemainingHours(account);
@@ -1067,19 +1176,59 @@ export async function runAutoSwitcher(): Promise<void> {
     // Don't yank a session that only just started.
     if (s.running_since && Date.now() - Date.parse(s.running_since) < MIN_RUNNING_AGE_MS) continue;
     if (!(await switchCooledDown(s.id))) continue;
+
+    if (remaining > 0) {
+      // GPU still has a little left. Move to another account only if it can
+      // spare GPU; otherwise keep using what's here (Phase A handles death).
+      const target = await rotationSwitchTarget(account.id, threshold);
+      if (!target) continue;
+      await markSwitchAttempt(s.id);
+      await performSwitchForSession(s, "gpu quota crossed while running (→ GPU)");
+      continue;
+    }
+
+    // Account is fully exhausted. Prefer another account with GPU; if none of
+    // the accounts has any GPU left, drop this session onto CPU so it keeps
+    // serving instead of bleeding the last GPU or dying.
+    const target = await rotationSwitchTarget(account.id, threshold);
     await markSwitchAttempt(s.id);
-    await performSwitchForSession(s, "gpu quota crossed while running");
+    if (target) {
+      await performSwitchForSession(s, "gpu exhausted (→ GPU on another account)");
+    } else {
+      await signalPlexusStop().catch(() => {});
+      await performSwitchForSession(s, "all accounts out of GPU (→ CPU mode)");
+    }
+  }
+
+  // Phase C — a session is running on CPU (mode recorded at push time) but its
+  // account (or a rotation target) has GPU hours available again after a weekly
+  // reset: bring it back onto the GPU.
+  for (const s of runningPlexus) {
+    if ((await getPlexusMode(s.id)) !== "cpu") continue;
+    const account = await getAccount(s.account_id);
+    if (!account) continue;
+    const remaining = await gpuRemainingHours(account);
+    if (remaining <= threshold) continue;
+    if (!(await switchCooledDown(s.id))) continue;
+    await markSwitchAttempt(s.id);
+    await signalPlexusStop().catch(() => {});
+    await performSwitchForSession(s, "gpu available again (→ GPU)");
   }
 }
 
 // Push the current bundled Plexus notebook to an account. Used by restart and
 // switch so those always deploy the latest script (pull→push could re-run an
 // outdated notebook that's already on Kaggle).
+//
+// CPU fallback: when the account has no GPU hours left the kernel is pushed
+// with enableGpu=false, so the Plexus server keeps running on CPU (slow, but
+// alive) instead of dying. The manager shows this as "running without GPU".
 async function pushBundledPlexus(
   account: KaggleAccountRow,
   slugName: string,
-  title?: string
-): Promise<void> {
+  title?: string,
+  opts?: { enableGpu?: boolean }
+): Promise<{ enableGpu: boolean }> {
   const [supabaseUrlRaw, supabaseKeyRaw, plexusTokenRaw, brainModelRaw, visionModelRaw, extraModelsRaw] =
     await Promise.all([
       getSetting("plexus_supabase_url"),
@@ -1089,6 +1238,8 @@ async function pushBundledPlexus(
       getSetting("plexus_vision_model"),
       getSetting("plexus_extra_models"),
     ]);
+  const remaining = await gpuRemainingHours(account);
+  const enableGpu = opts?.enableGpu ?? remaining > 0;
   const script = renderPlexusNotebook({
     supabaseUrl: supabaseUrlRaw || "",
     supabaseKey: supabaseKeyRaw || "",
@@ -1097,13 +1248,23 @@ async function pushBundledPlexus(
     visionModel: visionModelRaw || DEFAULT_VISION_MODEL,
     extraModels: parseExtraModels(extraModelsRaw),
   });
-  await createKernelFromScript(account, script, {
-    slugName,
-    title: title || "Plexus Ollama GPU Server",
-  });
+  const baseTitle = title || "Plexus Ollama GPU Server";
+  try {
+    await createKernelFromScript(account, script, { slugName, title: baseTitle, enableGpu });
+  } catch (err: any) {
+    // Kaggle rejects a push whose title collides with another notebook on the
+    // account (409). Retry once with a slug-qualified title so a restart/switch
+    // never dies just because an older same-titled kernel still exists.
+    if (/title/i.test(err?.message || "")) {
+      await createKernelFromScript(account, script, { slugName, title: `${baseTitle} ${slugName}`, enableGpu });
+    } else {
+      throw err;
+    }
+  }
   // Declare the expected token for this bundle so any stale kernel running a
   // previous token sees the mismatch and halts itself (and clears a stop).
   await signalPlexusToken(plexusTokenRaw || "plxk_K9deSj6KQZvXw_jDb2ZDWWT1ERJDs14IQV-GNNJKU1c").catch(() => {});
+  return { enableGpu };
 }
 
 // Manual restart (re-run on the same account).
@@ -1117,7 +1278,8 @@ export async function restartSession(sessionId: number): Promise<{ ok: boolean; 
     if (s.type === "plexus") {
       // Repush the bundled notebook (always current code), not a
       // pull→push of whatever is already on Kaggle.
-      await pushBundledPlexus(account, slugName);
+      const { enableGpu } = await pushBundledPlexus(account, slugName);
+      await setPlexusMode(sessionId, enableGpu);
     } else {
       const pulled = await pullKernel(account, s.slug);
       await pushKernel(account, pulled, slugName);
@@ -1126,6 +1288,9 @@ export async function restartSession(sessionId: number): Promise<{ ok: boolean; 
       status: "queued",
       status_changed_at: iso(new Date()),
       last_checked_at: iso(new Date()),
+      dead: 0,
+      dead_at: null,
+      running_since: null,
     });
     await eventLog(sessionId, account.id, s.status, "restart", "manual restart triggered via push");
     return { ok: true, slug: s.slug };
@@ -1145,7 +1310,8 @@ export async function switchSessionNow(sessionId: number): Promise<{ ok: boolean
   try {
     const slugName = s.slug.split("/").pop()!;
     if (s.type === "plexus") {
-      await pushBundledPlexus(target, slugName);
+      const { enableGpu } = await pushBundledPlexus(target, slugName);
+      await setPlexusMode(sessionId, enableGpu);
     } else {
       const pulled = await pullKernel(account, s.slug);
       await pushKernel(target, pulled, slugName);

@@ -2,13 +2,22 @@ import { rows, nowSql } from "./store";
 import { getSetting } from "./settings";
 
 export interface AlertPayload {
-  kind: "session_dead" | "session_switched" | "key_dead" | "plexus_down";
+  kind: "session_dead" | "session_switched" | "session_status" | "key_dead" | "plexus_down";
   title: string;
   lines: string[];
 }
 
+const KIND_EMOJI: Record<AlertPayload["kind"], string> = {
+  session_dead: "💀",
+  session_switched: "🔁",
+  session_status: "ℹ️",
+  key_dead: "🔑",
+  plexus_down: "🔌",
+};
+
 export function messageFrom(payload: AlertPayload): string {
-  return `🚨 Target API Manager — ${payload.title}\n\n${payload.lines.join("\n")}`;
+  const emoji = KIND_EMOJI[payload.kind] || "🚨";
+  return `${emoji} Target API Manager — ${payload.title}\n\n${payload.lines.join("\n")}`;
 }
 
 export async function sendAlert(payload: AlertPayload): Promise<void> {

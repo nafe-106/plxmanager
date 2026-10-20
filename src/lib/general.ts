@@ -234,15 +234,27 @@ interface GeneralLogRow {
 }
 
 // Combined capacity of the provider-key pool that general keys route over.
-// Limits are read from the per-model `token_limit` (the `tpd` you configure
-// when adding a key), falling back to the key-level `usage_limit` when a key
-// has no model limits set. `poolUsed` is tokens consumed TODAY across the pool.
+// Limits are summed from the per-model rows (tpd / rpd / rpm / tpm), falling
+// back to the key-level `usage_limit` for keys that have no model rows. Since
+// each key is its own account/quota pool, N keys contribute N× the per-model
+// limits — so 6 Gemini + 6 Groq keys with identical model configs add up to
+// 6× each provider's totals, not 1×.
+export interface PoolMetric {
+  limit: number;
+  used: number;
+  pct: number;
+}
+
 export interface GeneralPoolStats {
   poolKeys: number;
   poolUsed: number;
   poolLimit: number;
   poolLimitedKeys: number;
   poolPct: number;
+  tpd: PoolMetric;
+  tpm: PoolMetric;
+  rpd: PoolMetric;
+  rpm: PoolMetric;
 }
 
 export async function generalPoolStats(zone?: string): Promise<GeneralPoolStats> {
@@ -267,44 +279,65 @@ export async function generalPoolStats(zone?: string): Promise<GeneralPoolStats>
     else modelsByKey.set(m.key_id, [m]);
   }
 
-  let poolUsed = 0;
-  let poolLimit = 0;
+  let tpd = 0;
+  let tpm = 0;
+  let rpd = 0;
+  let rpm = 0;
+  let usedTokens = 0;
+  let hitsToday = 0;
   let poolLimitedKeys = 0;
 
   for (const k of eligible) {
     const keyRows = byKey.get(k.id) ?? [];
+    const models = (modelsByKey.get(k.id) ?? []).filter((m) => m.enabled);
     let hasLimit = false;
 
-    for (const m of modelsByKey.get(k.id) ?? []) {
-      if (!m.enabled) continue;
-      const lim = m.token_limit || 0;
-      poolUsed += keyRows
-        .filter((r) => r.model === m.model && r.day === scope.today)
-        .reduce((s, r) => s + (r.tokens ?? 0), 0);
-      if (lim > 0) {
-        poolLimit += lim;
+    for (const m of models) {
+      const todayRows = keyRows.filter((r) => r.model === m.model && r.day === scope.today);
+      usedTokens += todayRows.reduce((s, r) => s + (r.tokens ?? 0), 0);
+      hitsToday += todayRows.reduce((s, r) => s + (r.hits ?? 0), 0);
+      if (m.token_limit > 0) {
+        tpd += m.token_limit;
+        hasLimit = true;
+      }
+      if (m.rpd > 0) {
+        rpd += m.rpd;
+        hasLimit = true;
+      }
+      if (m.rpm > 0) {
+        rpm += m.rpm;
+        hasLimit = true;
+      }
+      if (m.tpm > 0) {
+        tpm += m.tpm;
         hasLimit = true;
       }
     }
 
     if (!hasLimit) {
       const lim = k.provider_limit ?? k.usage_limit ?? 0;
-      poolUsed +=
+      usedTokens +=
         k.provider_usage !== null ? k.provider_usage : periodTokensFrom(keyRows, k.usage_period, scope);
       if (lim > 0) {
-        poolLimit += lim;
+        tpd += lim;
         hasLimit = true;
       }
     }
     if (hasLimit) poolLimitedKeys++;
   }
 
+  const pct = (u: number, l: number) => (l > 0 ? Math.min(100, (u / l) * 100) : 0);
+
   return {
     poolKeys: eligible.length,
-    poolUsed,
-    poolLimit,
+    poolUsed: usedTokens,
+    poolLimit: tpd,
     poolLimitedKeys,
-    poolPct: poolLimit > 0 ? Math.min(100, (poolUsed / poolLimit) * 100) : 0,
+    poolPct: pct(usedTokens, tpd),
+    tpd: { limit: tpd, used: usedTokens, pct: pct(usedTokens, tpd) },
+    tpm: { limit: tpm, used: usedTokens, pct: pct(usedTokens, tpm) },
+    rpd: { limit: rpd, used: hitsToday, pct: pct(hitsToday, rpd) },
+    rpm: { limit: rpm, used: hitsToday, pct: pct(hitsToday, rpm) },
   };
 }
 

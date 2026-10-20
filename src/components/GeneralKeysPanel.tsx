@@ -3,6 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { Button, Card, Empty, formatTs } from "./ui";
 
+interface PoolMetric {
+  limit: number;
+  used: number;
+  pct: number;
+}
+
 interface GkRecord {
   id: number;
   name: string;
@@ -20,6 +26,41 @@ interface GkRecord {
   poolLimit: number;
   poolLimitedKeys: number;
   poolPct: number;
+  tpd: PoolMetric;
+  tpm: PoolMetric;
+  rpd: PoolMetric;
+  rpm: PoolMetric;
+}
+
+function barColor(pct: number): string {
+  return pct >= 90 ? "bg-red-500" : pct >= 70 ? "bg-amber-500" : "bg-emerald-500";
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}k`;
+  return String(n);
+}
+
+function PoolMetricCell({ label, m, isTokens }: { label: string; m: PoolMetric; isTokens: boolean }) {
+  const fmt = isTokens ? fmtTokens : (n: number) => n.toLocaleString();
+  return (
+    <div className="min-w-0">
+      <div className="flex items-baseline justify-between gap-1 text-[11px]">
+        <span className="text-zinc-500">{label}</span>
+        <span className="tabular-nums text-zinc-300">{m.limit > 0 ? `${m.pct.toFixed(1)}%` : "—"}</span>
+      </div>
+      <div className="truncate text-[10px] tabular-nums text-zinc-600">
+        {fmt(m.used)} / {m.limit > 0 ? fmt(m.limit) : "∞"}
+      </div>
+      <div className="mt-0.5 h-1 w-full overflow-hidden rounded bg-zinc-800">
+        <div
+          className={`h-full rounded transition-all ${m.limit === 0 ? "bg-zinc-700" : barColor(m.pct)}`}
+          style={{ width: `${m.limit === 0 ? 0 : Math.max(2, Math.min(100, m.pct))}%` }}
+        />
+      </div>
+    </div>
+  );
 }
 
 function CopyBtn({
@@ -251,30 +292,16 @@ export default function GeneralKeysPanel() {
               <div className="mt-2">
                 <div className="flex items-center justify-between text-[11px] text-zinc-500">
                   <span>
-                    combined pool{" "}
-                    <b className="tabular-nums text-zinc-300">{k.poolUsed.toLocaleString()}</b>
-                    {k.poolLimit > 0 ? <> / {k.poolLimit.toLocaleString()}</> : null} tokens
-                    {k.poolLimit > 0 && <span className="ml-1 text-zinc-400">({k.poolPct.toFixed(1)}%)</span>}
+                    combined pool · <b className="tabular-nums text-zinc-300">{k.poolKeys}</b> keys
+                    {k.poolLimitedKeys > 0 && <> · {k.poolLimitedKeys} with limits</>}
                   </span>
-                  <span>
-                    {k.poolLimit > 0
-                      ? `${k.poolLimitedKeys} of ${k.poolKeys} keys limited`
-                      : `${k.poolKeys} keys · no limits set`}
-                  </span>
+                  <span className="text-zinc-600">used today</span>
                 </div>
-                <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-zinc-800">
-                  <div
-                    className={`h-full rounded transition-all ${
-                      k.poolLimit === 0
-                        ? "bg-zinc-700"
-                        : k.poolPct >= 90
-                          ? "bg-red-500"
-                          : k.poolPct >= 70
-                            ? "bg-amber-500"
-                            : "bg-emerald-500"
-                    }`}
-                    style={{ width: `${k.poolLimit === 0 ? 0 : Math.max(2, Math.min(100, k.poolPct))}%` }}
-                  />
+                <div className="mt-1 grid grid-cols-4 gap-x-3 gap-y-1.5">
+                  <PoolMetricCell label="TPD" m={k.tpd} isTokens />
+                  <PoolMetricCell label="TPM" m={k.tpm} isTokens />
+                  <PoolMetricCell label="RPD" m={k.rpd} isTokens={false} />
+                  <PoolMetricCell label="RPM" m={k.rpm} isTokens={false} />
                 </div>
               </div>
               {k.note && <p className="mt-1 text-xs text-zinc-600">{k.note}</p>}

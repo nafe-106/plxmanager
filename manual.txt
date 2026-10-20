@@ -1,0 +1,186 @@
+========================================================================
+  GENERAL KEY MANUAL  (tam_gk_…)
+  OpenAI-compatible gateway over every provider key you have added
+========================================================================
+
+------------------------------------------------------------------------
+1. WHAT A GENERAL KEY IS
+------------------------------------------------------------------------
+A general key is issued by this app (secret starts with `tam_gk_`) and acts
+as ONE OpenAI-compatible endpoint sitting in front of ALL your added
+provider API keys (Groq, Cerebras, xAI, OpenAI, Gemini, OpenRouter, ...).
+
+  You  ──>  /v1/chat/completions  ──>  this app  ──>  one provider key
+                                                    (picked per request)
+
+You only ever hand out the single `tam_gk_` secret. The real provider keys
+never leave the server, and you can rotate/replace them without touching any
+client that uses the general key.
+
+------------------------------------------------------------------------
+2. WHERE TO GET ONE
+------------------------------------------------------------------------
+Keys page  ->  "General keys" panel  ->  Add key
+
+The secret is shown ONCE, at creation time. Use "Copy API key" immediately.
+If you lose it, use "Regenerate secret" (the old one stops working).
+
+------------------------------------------------------------------------
+3. CONNECTION SETTINGS
+------------------------------------------------------------------------
+  Base URL      https://plxmanager.vercel.app/v1
+                (also reachable at https://plxmanager.vercel.app/api/v1)
+
+  Auth header   Authorization: Bearer tam_gk_<your-secret>
+
+  Content-Type  application/json
+
+Supported endpoints
+  POST /v1/chat/completions     (streaming supported)
+  POST /v1/completions
+  POST /v1/embeddings
+  GET  /v1/models               (merged catalog across all your keys)
+  GET  /                        (health probe, no auth)
+
+------------------------------------------------------------------------
+4. MODEL NAMING
+------------------------------------------------------------------------
+GET /v1/models returns ids in OpenRouter style:
+
+  groq/openai/gpt-oss-120b
+  groq/llama-3.3-70b-versatile
+  cerebras/qwen-3-235b-a22b-instruct-2507
+  gemini/gemini-2.5-flash
+
+The FIRST segment is a provider prefix. If you send a known prefix
+(openrouter, cerebras, groq, xai, openai, gemini, other) the request is
+forced onto keys of that provider, and only the remainder is sent upstream.
+
+  "groq/openai/gpt-oss-120b"   ->  Groq keys only, upstream model
+                                   "openai/gpt-oss-120b"
+  "openai/gpt-oss-20b"         ->  treated as an org-scoped id, passed
+                                   through as-is
+  "llama-3.3-70b-versatile"    ->  no prefix, routed to any key that serves
+                                   that model
+
+------------------------------------------------------------------------
+5. EXAMPLES
+------------------------------------------------------------------------
+curl
+  curl https://plxmanager.vercel.app/v1/chat/completions \
+    -H "Authorization: Bearer tam_gk_YOUR_SECRET" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "groq/openai/gpt-oss-120b",
+      "messages": [{"role": "user", "content": "hello"}]
+    }'
+
+Node.js / OpenAI SDK
+  import OpenAI from "openai";
+  const client = new OpenAI({
+    apiKey: "tam_gk_YOUR_SECRET",
+    baseURL: "https://plxmanager.vercel.app/v1",
+  });
+  const r = await client.chat.completions.create({
+    model: "groq/openai/gpt-oss-120b",
+    messages: [{ role: "user", content: "hello" }],
+  });
+
+Python
+  from openai import OpenAI
+  client = OpenAI(
+      api_key="tam_gk_YOUR_SECRET",
+      base_url="https://plxmanager.vercel.app/v1",
+  )
+  r = client.chat.completions.create(
+      model="groq/openai/gpt-oss-120b",
+      messages=[{"role": "user", "content": "hello"}],
+  )
+
+OpenClaw / any OpenAI-compatible client
+  Set Base URL to https://plxmanager.vercel.app/v1
+  Set API key   to your tam_gk_… secret
+  Pick any model id from GET /v1/models
+
+------------------------------------------------------------------------
+6. HOW A REQUEST IS ROUTED BETWEEN YOUR KEYS
+------------------------------------------------------------------------
+Step 1 - candidates
+  Starts from every provider key that is enabled and not marked dead.
+
+Step 2 - can it serve the model?
+  The key must have that model in its live catalog (refreshed every 5 min),
+  OR have no model list at all (a key with no models is a wildcard and
+  serves anything).
+
+Step 3 - is it eligible?
+  Skipped when:
+    - its period token limit is already used up
+    - the requested model's requests-per-day (rpd) cap is hit
+
+Step 4 - pick the least loaded
+  For each remaining key:
+    used   = provider-reported usage, else tokens counted in this period
+    limit  = provider limit, else the key's configured limit, else 0
+    ratio  = used / limit        (or used / 1,000,000 if no limit is set)
+
+  The key with the LOWEST ratio wins. Keys within 1% of each other are
+  grouped and rotated round-robin, so equally idle keys share traffic
+  instead of one key taking everything.
+
+Step 5 - forward
+  The request body is forwarded verbatim; only the model id is rewritten
+  to the bare upstream name. The chosen key is injected as the provider
+  auth header.
+
+Step 6 - failover
+  Up to 2 attempts. A key is abandoned and another is picked when the
+  upstream times out (300s), errors on the network, or returns
+  401 / 403 / 429 / 5xx. Client errors (400 / 404) are passed through.
+  If both attempts fail you get 502 "All routed keys failed".
+
+------------------------------------------------------------------------
+7. LIMITS AND THE COMBINED POOL BAR
+------------------------------------------------------------------------
+Each provider key can have limits, and the dashboard shows a combined
+"pool" bar per general key:
+
+  - per-model limits  tpd (tokens/day), rpd, rpm, tpm, period, usage_hour
+    set when you add a key or paste model JSON
+  - key-level limit   tokens per daily/monthly/total period
+
+  combined pool  = sum of the enabled per-model tpd across all healthy keys
+                   (falls back to the key-level limit for keys with no model limits)
+  pool used      = tokens consumed TODAY across the whole pool
+  green < 70%   amber < 90%   red >= 90%
+
+Only healthy keys (enabled, not dead) count toward the pool.
+
+------------------------------------------------------------------------
+8. TROUBLESHOOTING
+------------------------------------------------------------------------
+401 "Invalid or missing general API key"
+    The secret is wrong, or you sent a provider key instead of a tam_gk_ one.
+
+404 model_not_found
+    No enabled key serves that model. Add the model to a key's list, or clear
+    the key's model list so it acts as a wildcard.
+
+503 service_unavailable
+    No enabled provider keys left. Add or enable keys.
+
+429 from upstream
+    The chosen provider key is rate limited. The gateway already retried on a
+    second key; if you still see it, every key is rate limited.
+
+502 All routed keys failed
+    Every candidate hard-failed (network / 401 / 403 / 429 / 5xx).
+    Check the key's status and "last checked" on the Keys page.
+
+"no limits set" on the pool bar
+    No key has a tpd or key-level limit configured, so there is nothing to
+    compute a percentage against.
+
+Slow first response
+    Model catalogs are cached for 5 minutes; the first request after a
+    refresh pays for fetching /models from each provider.

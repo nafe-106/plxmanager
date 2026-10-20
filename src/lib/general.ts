@@ -591,12 +591,11 @@ async function keyModels(keyId: number): Promise<{ id: string; owned_by?: string
 // the same upstream model from two providers stays two selectable models.
 export async function mergedModelCatalog(): Promise<GatewayModel[]> {
   const rowsArr = await rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" });
+  // Concurrent, not serial — a cold /v1/models call took 13s across 12 keys.
+  const fetched = await Promise.all(rowsArr.map(async (r) => [r, await keyModels(r.id)] as const));
   const out = new Map<string, GatewayModel>();
-  for (const r of rowsArr) {
+  for (const [r, models] of fetched) {
     const def = getProvider(r.provider);
-    // Live provider list first; DB rows are only a fallback when the provider
-    // is unreachable (keyModels already implements that policy).
-    const models = await keyModels(r.id);
     const all = new Set<string>();
     for (const m of models) all.add(m.id);
     for (const upstream of all) {
@@ -768,6 +767,13 @@ export async function selectRoute(
     else modelsByKey.set(m.key_id, [m]);
   }
 
+  // Fetch every provider catalog CONCURRENTLY. Doing this inside the loop cost
+  // 11s of serial HTTP round-trips on a cold start with 12 keys.
+  const catalogs = await Promise.all(
+    eligible.map(async (k) => [k.id, await keyModels(k.id)] as const)
+  );
+  const catalogById = new Map<number, { id: string }[]>(catalogs);
+
   const candidates: RouteCandidate[] = [];
 
   for (const k of eligible) {
@@ -778,12 +784,16 @@ export async function selectRoute(
     // here would reject the very provider that serves the model.
     if (want.auto && want.providerHint && providerId !== want.providerHint) continue;
 
-    // Key-level period limit (provider-reported or user-configured).
+    // Key-level period limit (provider-reported or user-configured). Only hit
+    // the DB when a limit actually exists — this was 2 queries x every key.
     const keyLimit = k.provider_limit ?? k.usage_limit ?? 0;
-    const keyUsed = k.provider_usage !== null ? k.provider_usage : await periodTokensUsed(k.id, k.usage_period, zone);
-    if (keyLimit > 0 && keyUsed >= keyLimit) continue;
+    if (keyLimit > 0) {
+      const keyUsed =
+        k.provider_usage !== null ? k.provider_usage : await periodTokensUsed(k.id, k.usage_period, zone);
+      if (keyUsed >= keyLimit) continue;
+    }
 
-    const catalog = await keyModels(k.id);
+    const catalog = catalogById.get(k.id) ?? [];
     if (!catalog.length) continue;
     const modelRows = modelsByKey.get(k.id) ?? [];
 

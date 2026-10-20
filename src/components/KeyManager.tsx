@@ -588,7 +588,11 @@ function KeyForm({
   const [provider, setProvider] = useState(initial?.provider ?? "openrouter");
   const [accountName, setAccountName] = useState(initial?.account_name ?? "");
   const [accountEmail, setAccountEmail] = useState(initial?.account_email ?? "");
-  const [apiKey, setApiKey] = useState("");
+  // One row per API key: in "add" mode you can stack several keys (they all
+  // share the provider, base URL, limits and model list). Edit mode keeps one.
+  const [keyEntries, setKeyEntries] = useState<{ name: string; key: string }[]>([
+    { name: "", key: "" },
+  ]);
   const [baseUrl, setBaseUrl] = useState(initial?.base_url ?? "");
   const [usageLimit, setUsageLimit] = useState(String(initial?.usage_limit ?? "0"));
   const [usagePeriod, setUsagePeriod] = useState(initial?.usage_period ?? "monthly");
@@ -617,7 +621,7 @@ function KeyForm({
     fetch(`/api/keys/${initial.id}/secret`)
       .then((r) => r.json())
       .then((j) => {
-        if (!cancelled && j.apiKey) setApiKey(j.apiKey);
+        if (!cancelled && j.apiKey) setKeyEntries([{ name: "", key: j.apiKey }]);
       })
       .catch(() => {});
     return () => {
@@ -637,6 +641,26 @@ function KeyForm({
 
   function setModelAt(i: number, patch: Partial<ModelDraft>) {
     setModels((prev) => prev.map((m, idx) => (idx === i ? { ...m, ...patch } : m)));
+  }
+
+  function setKeyAt(i: number, patch: { name?: string; key?: string }) {
+    setKeyEntries((prev) => prev.map((e, idx) => (idx === i ? { ...e, ...patch } : e)));
+  }
+
+  function addKeyEntry() {
+    setKeyEntries((prev) => [...prev, { name: "", key: "" }]);
+  }
+
+  function removeKeyEntry(i: number) {
+    setKeyEntries((prev) => prev.filter((_, idx) => idx !== i));
+  }
+
+  // What the per-key name field shows when left blank: the shared account name,
+  // numbered when several keys share it.
+  function keyNamePlaceholder(i: number) {
+    const base = accountName.trim();
+    if (!base) return i === 0 ? "e.g. my-account" : `my-account ${i + 1}`;
+    return i === 0 ? base : `${base} ${i + 1}`;
   }
 
   function loadModelsJson() {
@@ -674,9 +698,18 @@ function KeyForm({
     if (mode === "edit") {
       body.accountName = accountName;
       body.accountEmail = accountEmail;
-      if (apiKey.trim()) body.apiKey = apiKey.trim();
+      if (keyEntries[0]?.key.trim()) body.apiKey = keyEntries[0].key.trim();
     } else {
-      body.apiKey = apiKey.trim();
+      const entries = keyEntries.filter((x) => x.key.trim());
+      if (entries.length === 0) {
+        setError("Enter at least one API key");
+        setBusy(false);
+        return;
+      }
+      // Every row becomes its own api_keys record, sharing this provider,
+      // base URL, limits and model list.
+      body.apiKeys = entries.map((x) => ({ key: x.key.trim(), name: x.name.trim() }));
+      body.apiKey = entries[0].key.trim();
     }
     if (needsBaseUrl && !baseUrl.trim()) {
       setError("This provider needs a Base URL");
@@ -711,7 +744,7 @@ function KeyForm({
       >
         <div className="flex items-center justify-between">
           <h3 className="font-semibold text-zinc-100">
-            {mode === "edit" ? "Edit API key" : initial ? `Duplicate · ${initial.account_name}` : "Add API key"}
+            {mode === "edit" ? "Edit API key" : initial ? `Duplicate · ${initial.account_name}` : "Add API keys"}
           </h3>
           <button type="button" onClick={onClose} className="text-zinc-500 hover:text-zinc-300">✕</button>
         </div>
@@ -737,26 +770,93 @@ function KeyForm({
           <input type="email" className={inputCls} value={accountEmail} onChange={(e) => setAccountEmail(e.target.value)} />
         </Field>
 
-        <Field label={mode === "edit" ? "API key (leave blank to keep current)" : "API key *"}>
-          <div className="flex gap-2">
-            <input
-              type={showApiKey ? "text" : "password"}
-              autoComplete="new-password"
-              className={inputCls}
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              required={mode === "add"}
-              placeholder={mode === "edit" ? (apiKey ? "" : "••••••••") : "sk-…"}
-            />
-            <button
-              type="button"
-              onClick={() => setShowApiKey((s) => !s)}
-              className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 px-3 text-xs text-zinc-300 hover:bg-zinc-700"
-            >
-              {showApiKey ? "Hide" : "Show"}
-            </button>
+        {mode === "edit" ? (
+          <Field label="API key (leave blank to keep current)">
+            <div className="flex gap-2">
+              <input
+                type={showApiKey ? "text" : "password"}
+                autoComplete="new-password"
+                className={inputCls}
+                value={keyEntries[0]?.key ?? ""}
+                onChange={(e) => setKeyAt(0, { key: e.target.value })}
+                placeholder={keyEntries[0]?.key ? "" : "••••••••"}
+              />
+              <button
+                type="button"
+                onClick={() => setShowApiKey((s) => !s)}
+                className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 px-3 text-xs text-zinc-300 hover:bg-zinc-700"
+              >
+                {showApiKey ? "Hide" : "Show"}
+              </button>
+            </div>
+          </Field>
+        ) : (
+          <div>
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-xs font-medium text-zinc-500">
+                API keys * · {keyEntries.length} {keyEntries.length === 1 ? "key" : "keys"}
+              </span>
+              <button
+                type="button"
+                onClick={addKeyEntry}
+                className="text-xs font-medium text-emerald-400 hover:text-emerald-300"
+              >
+                + Add another key
+              </button>
+            </div>
+            <div className="space-y-2">
+              {keyEntries.map((entry, i) => (
+                <div
+                  key={i}
+                  className="flex flex-wrap items-end gap-2 rounded-lg border border-zinc-800 bg-zinc-950/40 p-2.5"
+                >
+                  <div className="min-w-0 flex-1">
+                    <span className="mb-1 block text-xs font-medium text-zinc-500">API key {i + 1} *</span>
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      autoComplete="new-password"
+                      className={inputCls}
+                      value={entry.key}
+                      onChange={(e) => setKeyAt(i, { key: e.target.value })}
+                      placeholder="sk-…"
+                    />
+                  </div>
+                  <div className="w-44">
+                    <span className="mb-1 block text-xs font-medium text-zinc-500">Account name</span>
+                    <input
+                      className={inputCls}
+                      value={entry.name}
+                      onChange={(e) => setKeyAt(i, { name: e.target.value })}
+                      placeholder={keyNamePlaceholder(i)}
+                    />
+                  </div>
+                  <div className="flex gap-1.5 pb-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey((s) => !s)}
+                      className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 px-3 text-xs text-zinc-300 hover:bg-zinc-700"
+                    >
+                      {showApiKey ? "Hide" : "Show"}
+                    </button>
+                    {keyEntries.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => removeKeyEntry(i)}
+                        className="shrink-0 rounded-lg border border-zinc-700 bg-zinc-800 px-3 text-xs text-zinc-400 hover:border-red-500/60 hover:text-red-400"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <p className="mt-1.5 text-[11px] text-zinc-600">
+              Every row becomes its own key under this provider — they share the base URL, limits and model
+              settings. Leave a name blank to use the shared account name (rows are numbered automatically).
+            </p>
           </div>
-        </Field>
+        )}
 
         <Field label={needsBaseUrl ? "Base URL *" : "Base URL (empty = provider default)"}>
           <input className={inputCls} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://" />
@@ -967,7 +1067,14 @@ function KeyForm({
         <div className="flex justify-end gap-2">
           <Button variant="secondary" onClick={onClose}>Cancel</Button>
           <Button variant="primary" type="submit" disabled={busy} className="px-4">
-            {busy ? "Saving…" : mode === "add" ? "Add key" : "Save changes"}
+            {busy
+              ? "Saving…"
+              : mode === "add"
+                ? (() => {
+                    const n = keyEntries.filter((x) => x.key.trim()).length;
+                    return `Add ${n} ${n === 1 ? "key" : "keys"}`;
+                  })()
+                : "Save changes"}
           </Button>
         </div>
       </form>

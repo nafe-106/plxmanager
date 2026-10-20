@@ -3,7 +3,20 @@ import { decrypt, encrypt } from "./crypto";
 import { healthCheck } from "./providers";
 import { sendAlert } from "./alerts";
 import { getSetting } from "./settings";
-import { logUsage, periodTokensUsed, usageSummary, usageHours, resetUsage, modelUsageList } from "./usage";
+import {
+  logUsage,
+  periodTokensUsed,
+  usageSummary,
+  usageHours,
+  resetUsage,
+  modelUsageList,
+  usageScope,
+  aggregateHourly,
+  periodTokensFrom,
+  type HourlyRow,
+  type KeyModelRow,
+} from "./usage";
+import { maskKey } from "./crypto";
 
 export interface ApiKeyRow {
   id: number;
@@ -128,6 +141,107 @@ export async function listKeys(): Promise<ApiKeyRow[]> {
   return rows<ApiKeyRow>("api_keys", {}, { order: "id" });
 }
 
+/**
+ * Load every key with its usage + per-model usage in THREE queries total.
+ *
+ * The per-key `withUsage` path re-fetches the whole `key_usage_hourly` slice for
+ * a key once for the summary, again for the period total, and twice more per
+ * model — ~20 full fetches for a Groq key with 8 models, all sequential, which
+ * made the Keys page take 15s+. Here everything is fetched once and aggregated
+ * in memory.
+ */
+export async function listKeysWithUsage(tz: string): Promise<Record<string, any>[]> {
+  const scope = await usageScope(tz);
+  const [allKeys, allUsage, allModels] = await Promise.all([
+    rows<ApiKeyRow>("api_keys", {}, { order: "id" }),
+    rows<HourlyRow>("key_usage_hourly", {}),
+    rows<KeyModelRow>("key_models", {}, { order: "id" }),
+  ]);
+
+  const usageByKey = new Map<number, HourlyRow[]>();
+  for (const r of allUsage) {
+    const bucket = usageByKey.get(r.key_id);
+    if (bucket) bucket.push(r);
+    else usageByKey.set(r.key_id, [r]);
+  }
+  const modelsByKey = new Map<number, KeyModelRow[]>();
+  for (const m of allModels) {
+    const bucket = modelsByKey.get(m.key_id);
+    if (bucket) bucket.push(m);
+    else modelsByKey.set(m.key_id, [m]);
+  }
+
+  const out: Record<string, any>[] = [];
+  for (const k of allKeys) {
+    const keyRows = usageByKey.get(k.id) ?? [];
+    const summary = aggregateHourly(keyRows, scope);
+    const used = periodTokensFrom(keyRows, k.usage_period, scope);
+
+    const models = (modelsByKey.get(k.id) ?? []).map((m) => {
+      const per = keyRows.filter((r) => r.model === m.model);
+      const s = aggregateHourly(per, scope);
+      const usedM = periodTokensFrom(per, m.period, scope);
+      const limit = m.token_limit || 0;
+      const pct = limit > 0 ? Math.min(100, (s.tokensToday / limit) * 100) : 0;
+      const reqPct = m.rpd > 0 ? Math.min(100, (s.hitsToday / m.rpd) * 100) : m.rpd === 0 ? 0 : 100;
+      return {
+        id: m.id,
+        keyId: k.id,
+        model: m.model,
+        tokenLimit: m.token_limit,
+        period: m.period,
+        usage_hour: m.usage_hour,
+        rpm: m.rpm,
+        rpd: m.rpd,
+        tpm: m.tpm,
+        enabled: m.enabled,
+        used: usedM,
+        tokensToday: s.tokensToday,
+        hitsToday: s.hitsToday,
+        hitsAll: s.hitsAll,
+        busyHour: s.busyHour,
+        pct: Math.round(pct * 10) / 10,
+        limitLeft: Math.max(0, limit - s.tokensToday),
+        reqPct: reqPct === 100 && m.rpd > 0 && s.hitsToday < m.rpd ? 99.9 : Math.round(reqPct * 10) / 10,
+        reqLeft: Math.max(0, m.rpd - s.hitsToday),
+      };
+    });
+
+    let plain = "";
+    try {
+      plain = decrypt(k.api_key_enc);
+    } catch {
+      plain = "";
+    }
+
+    const limit = k.provider_limit ?? k.usage_limit ?? 0;
+    const primaryUsed = k.provider_usage !== null ? k.provider_usage : used;
+    const pct = limit > 0 ? Math.min(100, (primaryUsed / limit) * 100) : 0;
+
+    const { api_key_enc: _drop, ...rest } = k as Record<string, any>;
+    out.push({
+      ...rest,
+      provider_mask: maskKey(plain),
+      masked_key: maskKey(plain),
+      lastCheck: k.last_checked_at,
+      models,
+      usage: {
+        ...summary,
+        used,
+        limit: k.usage_limit,
+        provider_usage: k.provider_usage,
+        provider_limit: k.provider_limit,
+        primaryUsed,
+        primaryLimit: limit,
+        pct: Math.round(pct * 10) / 10,
+        limitLeft: Math.max(0, limit - primaryUsed),
+        hours: summary.busyHour,
+      },
+    });
+  }
+  return out;
+}
+
 const VALID_PROVIDERS = ["openrouter", "cerebras", "groq", "xai", "openai", "gemini", "other"];
 
 function safeStr(v: unknown, max = 500): string {
@@ -139,34 +253,87 @@ function safeNum(v: unknown, def = 0): number {
   return Number.isFinite(n) ? n : def;
 }
 
+// One entry of a multi-key submission. A key row always belongs to a single
+// account, so adding N keys under one provider means N api_keys rows that share
+// the provider / base URL / limits / model list.
+export interface KeyEntryInput {
+  apiKey: string;
+  accountName: string;
+}
+
+// Normalise the body into a list of key entries. Accepts either the classic
+// single `apiKey` field or the multi-key `apiKeys: [{ key, name }]` array.
+// Returns [] when nothing usable was supplied, so the caller can reject it.
+function keyEntriesFrom(body: Record<string, unknown>): KeyEntryInput[] {
+  if (Array.isArray(body.apiKeys)) {
+    const entries = (body.apiKeys as unknown[]).map((raw) => {
+      const e = (raw ?? {}) as Record<string, unknown>;
+      return {
+        apiKey: safeStr(e.apiKey ?? e.key, 2000),
+        accountName: safeStr(e.accountName ?? e.name, 200),
+      };
+    });
+    // `apiKeys` was supplied — honour it as-is instead of silently falling back
+    // to the single-key field (which could mint a blank key row).
+    return entries.filter((e) => e.apiKey);
+  }
+  const single = {
+    apiKey: safeStr(body.apiKey, 2000),
+    accountName: safeStr(body.accountName, 200),
+  };
+  return single.apiKey ? [single] : [];
+}
+
 // Shared create logic used by POST /api/keys and POST /api/ai/ollama.
-export async function createKeyRow(body: Record<string, unknown>): Promise<{ id: number }> {
+// Creates ONE row per submitted key; returns every id it created.
+export async function createKeyRows(body: Record<string, unknown>): Promise<{ ids: number[] }> {
   const provider = safeStr(body.provider) || "other";
   if (!VALID_PROVIDERS.includes(provider)) {
     throw new Error("invalid provider");
   }
-  const accountName = safeStr(body.accountName, 200);
-  const apiKey = safeStr(body.apiKey, 2000);
-  if (!accountName || !apiKey) {
-    throw new Error("accountName and apiKey are required");
+  const sharedName = safeStr(body.accountName, 200);
+  const entries = keyEntriesFrom(body);
+  if (!entries.length) {
+    throw new Error("at least one API key is required");
   }
+  if (!sharedName && entries.some((e) => !e.accountName)) {
+    throw new Error("accountName is required (set it once at the top, or on every key)");
+  }
+
   const usageLimit = Math.max(0, safeNum(body.usageLimit));
   const usagePeriod = ["daily", "monthly", "total"].includes(String(body.usagePeriod)) ? String(body.usagePeriod) : "monthly";
   const usageHour = Math.max(0, Math.min(23, Math.round(safeNum(body.usageHour, 9))));
   const baseUrl = safeStr(body.baseUrl, 500);
-  const inserted = await insertRow<ApiKeyRow>("api_keys", {
-    provider,
-    account_name: accountName,
-    account_email: safeStr(body.accountEmail, 300),
-    api_key_enc: encrypt(body.apiKey as string),
-    base_url: baseUrl,
-    usage_limit: usageLimit,
-    usage_period: usagePeriod,
-    usage_hour: usageHour,
-  });
-  const keyId = Number(inserted.id);
-  if (Array.isArray(body.models)) await saveKeyModels(keyId, body.models);
-  return { id: keyId };
+  const models = Array.isArray(body.models) ? body.models : null;
+
+  const ids: number[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    // Per-key name wins; otherwise fall back to the shared name, auto-suffixed
+    // (2, 3, …) when several keys share it so rows stay distinguishable.
+    const base = e.accountName || sharedName;
+    const accountName =
+      !e.accountName && sharedName && entries.length > 1 && i > 0 ? `${sharedName} ${i + 1}` : base;
+    const inserted = await insertRow<ApiKeyRow>("api_keys", {
+      provider,
+      account_name: accountName,
+      account_email: safeStr(body.accountEmail, 300),
+      api_key_enc: encrypt(e.apiKey),
+      base_url: baseUrl,
+      usage_limit: usageLimit,
+      usage_period: usagePeriod,
+      usage_hour: usageHour,
+    });
+    const keyId = Number(inserted.id);
+    if (models) await saveKeyModels(keyId, models);
+    ids.push(keyId);
+  }
+  return { ids };
+}
+
+export async function createKeyRow(body: Record<string, unknown>): Promise<{ id: number }> {
+  const { ids } = await createKeyRows(body);
+  return { id: ids[0] };
 }
 
 export async function logKeyUsage(keyId: number, tokens: number, success: boolean, model?: string): Promise<void> {

@@ -1,8 +1,6 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
-import { rows } from "@/lib/store";
-import { createGeneralKey, generalKeyStats } from "@/lib/general";
-import { timezone } from "@/lib/settings";
+import { createGeneralKey, listGeneralKeysWithStats } from "@/lib/general";
 
 // ----- General (round-robin) keys · admin routes ----------------------------
 // GET  /api/general-keys        list keys + aggregate usage
@@ -12,25 +10,7 @@ import { timezone } from "@/lib/settings";
 export async function GET() {
   const g = await guard();
   if (g) return g;
-  const zone = await timezone();
-  const all = await rows<any>(
-    "general_keys",
-    {},
-    { order: "id" }
-  );
-  const keys = [];
-  for (const r of all) {
-    keys.push({
-      id: r.id,
-      name: r.name,
-      note: r.note,
-      enabled: r.enabled,
-      created_at: r.created_at,
-      last_used_at: r.last_used_at,
-      hasSecret: !!r.secret_enc,
-      ...(await generalKeyStats(r.id, zone)),
-    });
-  }
+  const keys = await listGeneralKeysWithStats();
   return NextResponse.json({ keys });
 }
 

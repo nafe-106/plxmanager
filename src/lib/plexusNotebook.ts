@@ -371,6 +371,39 @@ for model in EXTRA_MODELS:
         ensure_model(model)
 
 
+# Warm the brain into memory (and pin it with a long keep_alive) so the first
+# real request does not pay the model-load cost. On a cold model that load can
+# push time-to-first-token past Cloudflare's ~100s idle limit and cause HTTP 524.
+def warm_brain(model):
+    if not model:
+        return
+    try:
+        print(f"Warming {model}")
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/generate",
+            data=json.dumps({
+                "model": model,
+                "prompt": "ok",
+                "stream": False,
+                "keep_alive": "24h",
+                "options": {"num_predict": 1},
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=900) as response:
+            response.read()
+        print(f"OK warm {model}")
+    except Exception as exc:
+        print(f"Warm-up skipped: {exc}")
+
+
+warm_brain(BRAIN_MODEL)
+
+if VISION_MODEL:
+    warm_brain(VISION_MODEL)
+
+
 # ============================================================
 # 6. AUTH PROXY
 # ============================================================

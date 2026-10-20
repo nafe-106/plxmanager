@@ -16,14 +16,89 @@ import { getSetting, timezone } from "./settings";
 
 export { tzParts, dayKey, dayKeyFromParts, monthStartKey, weekStartKey, addDays, type TzParts };
 
-type HourlyRow = {
+export interface HourlyRow {
   key_id: number;
   model: string;
   day: string;
   hour: number;
   hits: number;
   tokens: number;
-};
+}
+
+// Pre-computed window boundaries shared by every aggregation below, so a batch
+// caller resolves them once instead of per key/model.
+export interface UsageScope {
+  today: string;
+  wkStart: string;
+  monthStart: string;
+}
+
+export interface UsageAgg {
+  hitsToday: number;
+  tokensToday: number;
+  hitsWeek: number;
+  hitsAll: number;
+  tokensAll: number;
+  tokensMonth: number;
+  busyHour: number | null;
+  busyHits: number;
+}
+
+export async function usageScope(tz?: string): Promise<UsageScope> {
+  const zone = tz ?? (await timezone());
+  return {
+    today: dayKey(zone),
+    wkStart: weekStartKey(zone, await usageWeekResetDay()),
+    monthStart: monthStartKey(zone),
+  };
+}
+
+// Pure in-memory aggregation over already-fetched hourly rows.
+export function aggregateHourly(all: HourlyRow[], scope: UsageScope): UsageAgg {
+  let hitsAll = 0;
+  let tokensAll = 0;
+  let hitsToday = 0;
+  let tokensToday = 0;
+  let hitsWeek = 0;
+  let tokensMonth = 0;
+  const byHour = new Map<number, number>();
+  for (const r of all) {
+    hitsAll += r.hits ?? 0;
+    tokensAll += r.tokens ?? 0;
+    if (r.day === scope.today) {
+      hitsToday += r.hits ?? 0;
+      tokensToday += r.tokens ?? 0;
+    }
+    if (r.day >= scope.wkStart) hitsWeek += r.hits ?? 0;
+    if (r.day >= scope.monthStart) tokensMonth += r.tokens ?? 0;
+    byHour.set(r.hour, (byHour.get(r.hour) ?? 0) + (r.hits ?? 0));
+  }
+  let busyHour: number | null = null;
+  let busyHits = 0;
+  for (const [h, n] of byHour) {
+    if (n > busyHits) {
+      busyHits = n;
+      busyHour = h;
+    }
+  }
+  return { hitsToday, tokensToday, hitsWeek, hitsAll, tokensAll, tokensMonth, busyHour, busyHits };
+}
+
+export function periodTokensFrom(all: HourlyRow[], period: string, scope: UsageScope): number {
+  if (period === "daily") {
+    return all.filter((r) => r.day === scope.today).reduce((s, r) => s + (r.tokens ?? 0), 0);
+  }
+  if (period === "monthly") {
+    return all.filter((r) => r.day >= scope.monthStart).reduce((s, r) => s + (r.tokens ?? 0), 0);
+  }
+  return all.reduce((s, r) => s + (r.tokens ?? 0), 0);
+}
+
+export function usageHoursFrom(all: HourlyRow[]): number[] {
+  const out = new Array(24).fill(0);
+  for (const r of all) if (r.hour >= 0 && r.hour < 24) out[r.hour] += r.hits ?? 0;
+  return out;
+}
 
 export async function usageWeekResetDay(): Promise<number> {
   return Math.max(0, Math.min(6, parseInt((await getSetting("usage_week_reset_day")) || "0", 10) || 0));
@@ -71,75 +146,22 @@ function hourFilters(keyId: number, model?: string): Where {
 
 // ----- Aggregation ---------------------------------------------------------
 export async function usageSummary(keyId: number, tz?: string, model?: string) {
-  const zone = tz ?? (await timezone());
-  const today = dayKey(zone);
-  const wkStart = weekStartKey(zone, await usageWeekResetDay());
-  const monthStart = monthStartKey(zone);
-  const mf = hourFilters(keyId, model);
-
-  const all = await rows<HourlyRow>("key_usage_hourly", mf);
-  let hitsAll = 0;
-  let tokensAll = 0;
-  let hitsToday = 0;
-  let tokensToday = 0;
-  let hitsWeek = 0;
-  let tokensMonth = 0;
-  const byHour = new Map<number, number>();
-  for (const r of all) {
-    hitsAll += r.hits ?? 0;
-    tokensAll += r.tokens ?? 0;
-    if (r.day === today) {
-      hitsToday += r.hits ?? 0;
-      tokensToday += r.tokens ?? 0;
-    }
-    if (r.day >= wkStart) hitsWeek += r.hits ?? 0;
-    if (r.day >= monthStart) tokensMonth += r.tokens ?? 0;
-    byHour.set(r.hour, (byHour.get(r.hour) ?? 0) + (r.hits ?? 0));
-  }
-  let busyHour: number | null = null;
-  let busyHits = 0;
-  for (const [h, n] of byHour) {
-    if (n > busyHits) {
-      busyHits = n;
-      busyHour = h;
-    }
-  }
-
-  return {
-    hitsToday,
-    tokensToday,
-    hitsWeek,
-    hitsAll,
-    tokensAll,
-    tokensMonth,
-    busyHour,
-    busyHits,
-  };
+  const scope = await usageScope(tz);
+  const all = await rows<HourlyRow>("key_usage_hourly", hourFilters(keyId, model));
+  return aggregateHourly(all, scope);
 }
 
 // Tokens "used" for the key's configured period (daily/monthly/total).
 export async function periodTokensUsed(keyId: number, period: string, tz?: string, model?: string): Promise<number> {
-  const zone = tz ?? (await timezone());
-  const mf = hourFilters(keyId, model);
-  const all = await rows<HourlyRow>("key_usage_hourly", mf);
-  if (period === "daily") {
-    const day = dayKey(zone);
-    return all.filter((r) => r.day === day).reduce((s, r) => s + (r.tokens ?? 0), 0);
-  }
-  if (period === "monthly") {
-    const start = monthStartKey(zone);
-    return all.filter((r) => r.day >= start).reduce((s, r) => s + (r.tokens ?? 0), 0);
-  }
-  return all.reduce((s, r) => s + (r.tokens ?? 0), 0);
+  const scope = await usageScope(tz);
+  const all = await rows<HourlyRow>("key_usage_hourly", hourFilters(keyId, model));
+  return periodTokensFrom(all, period, scope);
 }
 
 // 24 hourly buckets (hits), in local time.
 export async function usageHours(keyId: number, model?: string): Promise<number[]> {
-  const mf = hourFilters(keyId, model);
-  const all = await rows<HourlyRow>("key_usage_hourly", mf);
-  const out = new Array(24).fill(0);
-  for (const r of all) if (r.hour >= 0 && r.hour < 24) out[r.hour] += r.hits ?? 0;
-  return out;
+  const all = await rows<HourlyRow>("key_usage_hourly", hourFilters(keyId, model));
+  return usageHoursFrom(all);
 }
 
 export async function resetUsage(keyId: number, model?: string): Promise<void> {

@@ -1,22 +1,16 @@
 import { NextResponse } from "next/server";
 import { guard } from "@/lib/auth";
-import { decrypt, maskKey } from "@/lib/crypto";
 import { timezone } from "@/lib/settings";
-import { withUsage, listKeys, createKeyRow } from "@/lib/keys";
+import { listKeysWithUsage, createKeyRows } from "@/lib/keys";
 
 export async function GET() {
   const g = await guard();
   if (g) return g;
   const tz = await timezone();
-  const raw = await listKeys();
-  const rows = [];
-  for (const k of raw) {
-    const enriched = await withUsage(k, tz);
-    (enriched as any).provider_mask = maskKey(decrypt(k.api_key_enc));
-    delete enriched.api_key_enc;
-    rows.push(enriched);
-  }
-  return NextResponse.json({ keys: rows });
+  // One pass over keys + usage + models (3 queries) instead of re-fetching
+  // every key's usage slice once per key and per model.
+  const keys = await listKeysWithUsage(tz);
+  return NextResponse.json({ keys });
 }
 
 export async function POST(req: Request) {
@@ -24,8 +18,8 @@ export async function POST(req: Request) {
   if (g) return g;
   const body = await req.json().catch(() => ({}));
   try {
-    const { id } = await createKeyRow(body);
-    return NextResponse.json({ id }, { status: 201 });
+    const { ids } = await createKeyRows(body);
+    return NextResponse.json({ id: ids[0], ids }, { status: 201 });
   } catch (err) {
     return NextResponse.json({ error: (err as Error).message }, { status: 400 });
   }

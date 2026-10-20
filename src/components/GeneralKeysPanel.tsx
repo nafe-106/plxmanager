@@ -15,6 +15,11 @@ interface GkRecord {
   hitsToday: number;
   tokensToday: number;
   hasSecret: boolean;
+  poolKeys: number;
+  poolUsed: number;
+  poolLimit: number;
+  poolLimitedKeys: number;
+  poolPct: number;
 }
 
 function CopyBtn({
@@ -241,6 +246,35 @@ export default function GeneralKeysPanel() {
                       Regenerate secret
                     </Button>
                   )}
+                </div>
+              </div>
+              <div className="mt-2">
+                <div className="flex items-center justify-between text-[11px] text-zinc-500">
+                  <span>
+                    combined pool{" "}
+                    <b className="tabular-nums text-zinc-300">{k.poolUsed.toLocaleString()}</b>
+                    {k.poolLimit > 0 ? <> / {k.poolLimit.toLocaleString()}</> : null} tokens
+                    {k.poolLimit > 0 && <span className="ml-1 text-zinc-400">({k.poolPct.toFixed(1)}%)</span>}
+                  </span>
+                  <span>
+                    {k.poolLimit > 0
+                      ? `${k.poolLimitedKeys} of ${k.poolKeys} keys limited`
+                      : `${k.poolKeys} keys · no limits set`}
+                  </span>
+                </div>
+                <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-zinc-800">
+                  <div
+                    className={`h-full rounded transition-all ${
+                      k.poolLimit === 0
+                        ? "bg-zinc-700"
+                        : k.poolPct >= 90
+                          ? "bg-red-500"
+                          : k.poolPct >= 70
+                            ? "bg-amber-500"
+                            : "bg-emerald-500"
+                    }`}
+                    style={{ width: `${k.poolLimit === 0 ? 0 : Math.max(2, Math.min(100, k.poolPct))}%` }}
+                  />
                 </div>
               </div>
               {k.note && <p className="mt-1 text-xs text-zinc-600">{k.note}</p>}

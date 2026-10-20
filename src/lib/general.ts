@@ -3,7 +3,16 @@ import { byId, rows, row, insertRow, insertMany, updateRow, upsertRows, nowSql }
 import { decrypt, encrypt } from "./crypto";
 import { getProvider, PROVIDERS } from "./providers";
 import { timezone, getSetting } from "./settings";
-import { dayKeyFromParts, tzParts, logUsage, periodTokensUsed } from "./usage";
+import {
+  dayKeyFromParts,
+  tzParts,
+  logUsage,
+  periodTokensUsed,
+  usageScope,
+  periodTokensFrom,
+  type HourlyRow,
+  type KeyModelRow,
+} from "./usage";
 import type { ApiKeyRow } from "./keys";
 
 // ----- General (round-robin) keys ------------------------------------------
@@ -213,6 +222,141 @@ export async function generalKeyStats(gkId: number, zone?: string) {
     tokensToday,
     perKey: [...perKey.entries()].map(([key_id, v]) => ({ key_id, ...v })).sort((a, b) => b.hits - a.hits),
   };
+}
+
+interface GeneralLogRow {
+  gk_id: number;
+  key_id: number | null;
+  hits: number;
+  tokens: number;
+  day: string;
+  hour: number;
+}
+
+// Combined capacity of the provider-key pool that general keys route over.
+// Limits are read from the per-model `token_limit` (the `tpd` you configure
+// when adding a key), falling back to the key-level `usage_limit` when a key
+// has no model limits set. `poolUsed` is tokens consumed TODAY across the pool.
+export interface GeneralPoolStats {
+  poolKeys: number;
+  poolUsed: number;
+  poolLimit: number;
+  poolLimitedKeys: number;
+  poolPct: number;
+}
+
+export async function generalPoolStats(zone?: string): Promise<GeneralPoolStats> {
+  const z = zone ?? (await timezone());
+  const scope = await usageScope(z);
+  const [eligible, allUsage, allModels] = await Promise.all([
+    rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" }),
+    rows<HourlyRow>("key_usage_hourly", {}),
+    rows<KeyModelRow>("key_models", {}, { order: "id" }),
+  ]);
+
+  const byKey = new Map<number, HourlyRow[]>();
+  for (const r of allUsage) {
+    const b = byKey.get(r.key_id);
+    if (b) b.push(r);
+    else byKey.set(r.key_id, [r]);
+  }
+  const modelsByKey = new Map<number, KeyModelRow[]>();
+  for (const m of allModels) {
+    const b = modelsByKey.get(m.key_id);
+    if (b) b.push(m);
+    else modelsByKey.set(m.key_id, [m]);
+  }
+
+  let poolUsed = 0;
+  let poolLimit = 0;
+  let poolLimitedKeys = 0;
+
+  for (const k of eligible) {
+    const keyRows = byKey.get(k.id) ?? [];
+    let hasLimit = false;
+
+    for (const m of modelsByKey.get(k.id) ?? []) {
+      if (!m.enabled) continue;
+      const lim = m.token_limit || 0;
+      poolUsed += keyRows
+        .filter((r) => r.model === m.model && r.day === scope.today)
+        .reduce((s, r) => s + (r.tokens ?? 0), 0);
+      if (lim > 0) {
+        poolLimit += lim;
+        hasLimit = true;
+      }
+    }
+
+    if (!hasLimit) {
+      const lim = k.provider_limit ?? k.usage_limit ?? 0;
+      poolUsed +=
+        k.provider_usage !== null ? k.provider_usage : periodTokensFrom(keyRows, k.usage_period, scope);
+      if (lim > 0) {
+        poolLimit += lim;
+        hasLimit = true;
+      }
+    }
+    if (hasLimit) poolLimitedKeys++;
+  }
+
+  return {
+    poolKeys: eligible.length,
+    poolUsed,
+    poolLimit,
+    poolLimitedKeys,
+    poolPct: poolLimit > 0 ? Math.min(100, (poolUsed / poolLimit) * 100) : 0,
+  };
+}
+
+// All general keys with usage + the shared pool capacity in FOUR queries total
+// (was: one log scan per key, which made this panel slow as keys accumulated).
+export async function listGeneralKeysWithStats(zone?: string): Promise<Record<string, any>[]> {
+  const z = zone ?? (await timezone());
+  const [all, pool] = await Promise.all([
+    rows("general_keys", {}, { order: "id" }),
+    generalPoolStats(z),
+  ]);
+  const logs = await rows<GeneralLogRow>("general_key_logs", {});
+
+  const today = dayKeyFromParts(tzParts(z));
+  const byGk = new Map<number, GeneralLogRow[]>();
+  for (const r of logs) {
+    const b = byGk.get(r.gk_id);
+    if (b) b.push(r);
+    else byGk.set(r.gk_id, [r]);
+  }
+
+  return all.map((r: any) => {
+    const l = byGk.get(r.id) ?? [];
+    const hitsAll = l.reduce((s, x) => s + (x.hits ?? 0), 0);
+    const tokensAll = l.reduce((s, x) => s + (x.tokens ?? 0), 0);
+    const todayRows = l.filter((x) => x.day === today);
+    const hitsToday = todayRows.reduce((s, x) => s + (x.hits ?? 0), 0);
+    const tokensToday = todayRows.reduce((s, x) => s + (x.tokens ?? 0), 0);
+    const perKey = new Map<number, { hits: number; tokens: number }>();
+    for (const x of l) {
+      if (x.key_id === null || x.key_id === undefined) continue;
+      const e = perKey.get(x.key_id) ?? { hits: 0, tokens: 0 };
+      e.hits += x.hits ?? 0;
+      e.tokens += x.tokens ?? 0;
+      perKey.set(x.key_id, e);
+    }
+    return {
+      id: r.id,
+      name: r.name,
+      note: r.note,
+      enabled: r.enabled,
+      created_at: r.created_at,
+      last_used_at: r.last_used_at,
+      hasSecret: !!r.secret_enc,
+      hitsAll,
+      tokensAll,
+      hitsToday,
+      tokensToday,
+      perKey: [...perKey.entries()].map(([key_id, v]) => ({ key_id, ...v })).sort((a, b) => b.hits - a.hits),
+      ...pool,
+    };
+  });
 }
 
 // ----- OpenAI-compatible proxy helpers --------------------------------------

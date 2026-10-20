@@ -23,6 +23,11 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   // Provider routing order, highest priority first. Comma-separated provider
   // ids; anything not listed is tried last. Edited from the dashboard.
   provider_priority: "groq,gemini,cerebras,openai,xai,openrouter,other",
+  // Models the manager uses when a client sends NO model (or "auto"), highest
+  // preference first. Gateway ids ("groq/openai/gpt-oss-120b") or bare ids.
+  // Only used as a ranking hint — entries with no capacity are skipped and the
+  // next best candidate is chosen. Edited from the dashboard.
+  auto_models: "groq/openai/gpt-oss-120b,gemini/gemini-3.8-flash",
 };
 
 // Allow the Plexus/Supabase settings to be supplied via env vars instead of
@@ -85,4 +90,14 @@ export async function providerPriority(): Promise<string[]> {
   // so fall back here or an untouched install would route with an empty list.
   const raw = (await getSetting("provider_priority")) ?? SETTING_DEFAULTS.provider_priority;
   return parseProviderPriority(raw);
+}
+
+// Ordered default models for no-model/"auto" requests (raw strings; matched
+// against candidates by parseAutoModel below). Falls back to the default list.
+export async function autoModelPriority(): Promise<string[]> {
+  const raw = (await getSetting("auto_models")) ?? SETTING_DEFAULTS.auto_models;
+  return (raw || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
 }

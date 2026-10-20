@@ -47,6 +47,16 @@ function errorJson(status: number, message: string, type = "invalid_request_erro
 
 type RouteCtx = { params: Promise<{ path?: string[] }> };
 
+// Pull "message" out of an OpenAI/Google-style error body ("" if unparseable).
+function upstreamErrorMessage(text: string): string {
+  try {
+    const j = JSON.parse(text);
+    return String(j?.error?.message ?? j?.message ?? "").slice(0, 240);
+  } catch {
+    return String(text || "").slice(0, 240);
+  }
+}
+
 async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
   const { path: segments = [] } = await ctx.params;
   const clientPath = segments.join("/");
@@ -98,19 +108,20 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
     return errorJson(400, "Request body must be valid JSON.");
   }
 
-  const maxAttempts = 2; // one retry on a different key if the first fails pre-response
+  const maxAttempts = 3; // fail over across keys AND models
   let lastError = "";
   const tried: number[] = [];
+  const excludeModels: string[] = []; // models the upstream already refused
   const asked = analyzeRequestedModel(model);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // THE MANAGER picks model + key together: dashboard provider priority
     // first, then whichever candidate still has the most capacity.
-    const routed = await selectRoute(model || undefined, { exclude: tried });
+    const routed = await selectRoute(model || undefined, { exclude: tried, excludeModels });
     if (!routed.choice) {
       return errorJson(
         asked.auto ? 503 : 404,
-        routed.reason,
+        lastError ? `${routed.reason} (${lastError})` : routed.reason,
         asked.auto ? "service_unavailable" : "model_not_found"
       );
     }
@@ -143,9 +154,14 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
     let forwardBody = bodyText;
     try {
       const parsed = JSON.parse(bodyText);
-      normalizeToolSchemas(parsed);
-      if (upstreamModel && upstreamModel !== model) parsed.model = upstreamModel;
-      forwardBody = JSON.stringify(parsed);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        normalizeToolSchemas(parsed);
+        // ALWAYS inject the routed model. Clients that omit `model` (or send an
+        // empty one) rely on the manager choosing — upstream rejects an absent
+        // field with 400, so this is the default-model path.
+        if (upstreamModel) parsed.model = upstreamModel;
+        forwardBody = JSON.stringify(parsed);
+      }
     } catch {
       // non-JSON body — forward verbatim
     }
@@ -163,6 +179,20 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
     } catch (err: any) {
       lastError = err?.name === "TimeoutError" || err?.name === "AbortError" ? "upstream timeout" : err?.message || "upstream network error";
       continue; // try another key
+    }
+
+    // Providers keep retired ids in their /models list but refuse them on
+    // chat (Gemini: "gemini-2.5-flash is no longer available"). Those must
+    // route to another model instead of leaking a 404 to the client.
+    if (res.status === 404) {
+      const errText = await res.text().catch(() => "");
+      const msg = upstreamErrorMessage(errText);
+      if (/model/i.test(msg || errText)) {
+        excludeModels.push(choice.model);
+        lastError = `upstream 404 for model '${choice.model}': ${msg || "not available"}`;
+        if (attempt < maxAttempts) continue;
+      }
+      res = new Response(errText, { status: 404, headers: res.headers });
     }
 
     // Retryable upstream failures (dead key, rate limit, provider 5xx).

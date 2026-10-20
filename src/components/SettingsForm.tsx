@@ -94,6 +94,7 @@ export default function SettingsForm() {
       plexus_vision_model: values.plexus_vision_model,
       plexus_extra_models: values.plexus_extra_models,
       provider_priority: priorityList.join(","),
+      auto_models: values.auto_models,
     };
     if (newPassword.trim()) body.admin_password = newPassword.trim();
     if (resetPassword) body.admin_password_reset = true;
@@ -258,6 +259,19 @@ export default function SettingsForm() {
             </select>
           </label>
         )}
+        <Field label="Default models when the client sends no model (highest preference first)">
+          <input
+            className={inputCls + " font-mono text-xs"}
+            value={values.auto_models ?? ""}
+            onChange={(e) => setVal("auto_models", e.target.value)}
+            placeholder="gemini/gemini-3.8-flash,groq/openai/gpt-oss-120b"
+          />
+        </Field>
+        <p className="text-xs text-zinc-500">
+          Comma-separated gateway ids. The manager tries them in this order after applying the provider priority above;
+          one with no capacity (or one the provider no longer serves) is skipped automatically. Leave empty to rank
+          purely by remaining capacity.
+        </p>
         <p className="text-[11px] text-zinc-600">
           Saved as <span className="font-mono">{priorityList.join(",") || "(empty)"}</span>
         </p>

@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { byId, rows, row, insertRow, insertMany, updateRow, upsertRows, nowSql } from "./store";
 import { decrypt, encrypt } from "./crypto";
 import { getProvider, PROVIDERS } from "./providers";
-import { timezone, getSetting, providerPriority } from "./settings";
+import { timezone, getSetting, providerPriority, autoModelPriority } from "./settings";
 import {
   dayKeyFromParts,
   tzParts,
@@ -436,7 +436,11 @@ export function upstreamHeaders(provider: string, apiKey: string, bodyLength: nu
     "User-Agent": "target-api-manager/1.0",
   };
   if (bodyLength > 0) h["Content-Length"] = String(bodyLength);
-  if (def.authType === "bearer") h.Authorization = `Bearer ${apiKey}`;
+  // Gemini is authType "query" (?key= on the REST endpoints), but its
+  // OpenAI-compat layer at /v1beta/openai/chat/completions rejects query auth
+  // with 400 "Missing or invalid Authorization header" — so always send Bearer
+  // too. Harmless elsewhere: every provider key is a bearer-style secret.
+  h.Authorization = `Bearer ${apiKey}`;
   return h;
 }
 
@@ -591,11 +595,26 @@ async function keyModels(keyId: number): Promise<{ id: string; owned_by?: string
 // the same upstream model from two providers stays two selectable models.
 export async function mergedModelCatalog(): Promise<GatewayModel[]> {
   const rowsArr = await rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" });
-  // Concurrent, not serial — a cold /v1/models call took 13s across 12 keys.
-  const fetched = await Promise.all(rowsArr.map(async (r) => [r, await keyModels(r.id)] as const));
+  // The dashboard's curated key_models rows are authoritative and instant.
+  // Only keys with no rows at all need a live provider fetch (and those are
+  // fetched concurrently — this endpoint used to take 13s across 12 keys).
+  const dbModels = await rows<KeyModelRow>("key_models", { enabled: 1 }, { order: "id" });
+  const byKey = new Map<number, { id: string; owned_by?: string; context_length?: number }[]>();
+  for (const m of dbModels) {
+    const arr = byKey.get(m.key_id);
+    const entry = { id: m.model };
+    if (arr) arr.push(entry);
+    else byKey.set(m.key_id, [entry]);
+  }
+  const wildcards = rowsArr.filter((r) => !byKey.has(r.id));
+  const live = new Map(
+    await Promise.all(wildcards.map(async (r) => [r.id, await keyModels(r.id)] as const))
+  );
+
   const out = new Map<string, GatewayModel>();
-  for (const [r, models] of fetched) {
+  for (const r of rowsArr) {
     const def = getProvider(r.provider);
+    const models = byKey.get(r.id) ?? live.get(r.id) ?? [];
     const all = new Set<string>();
     for (const m of models) all.add(m.id);
     for (const upstream of all) {
@@ -700,6 +719,7 @@ export interface RouteCandidate {
   model: string;
   score: number; // 0..1 headroom, 1 = wide open
   rank: number;
+  pref: number; // index in the dashboard default-model list (auto only)
   tokensToday: number;
   hitsToday: number;
 }
@@ -719,14 +739,28 @@ export interface RouteResult {
 // soft pressure only — never a hard rejection on their own.
 export async function selectRoute(
   requested: string | undefined,
-  opts: { priority?: string[]; exclude?: number[] } = {}
+  opts: { priority?: string[]; exclude?: number[]; excludeModels?: string[] } = {}
 ): Promise<RouteResult> {
   const want = analyzeRequestedModel(requested);
   const zone = await timezone();
   const scope = await usageScope(zone);
   const priority = opts.priority ?? (await providerPriority());
   const exclude = opts.exclude ?? [];
+  const excludeModels = opts.excludeModels ?? [];
   const hourNow = tzParts(zone).hour;
+
+  // Default-model preference for no-model requests: dashboard auto_models list.
+  // A model that upstream just retired (404) is passed back through
+  // opts.excludeModels so it never gets picked twice in one request.
+  const autoPref = want.auto ? await autoModelPriority() : [];
+  const prefOf = (providerId: string, modelId: string): number => {
+    for (let i = 0; i < autoPref.length; i++) {
+      const s = splitGatewayModel(autoPref[i]);
+      if ((!s.provider || s.provider === providerId) && s.upstream === modelId) return i;
+      if (autoPref[i] === modelId) return i;
+    }
+    return autoPref.length; // not in the default list — ranks last of equals
+  };
 
   const [eligible, todayRows, allModels] = await Promise.all([
     rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" }),
@@ -767,12 +801,18 @@ export async function selectRoute(
     else modelsByKey.set(m.key_id, [m]);
   }
 
-  // Fetch every provider catalog CONCURRENTLY. Doing this inside the loop cost
-  // 11s of serial HTTP round-trips on a cold start with 12 keys.
-  const catalogs = await Promise.all(
-    eligible.map(async (k) => [k.id, await keyModels(k.id)] as const)
+  // Routing reads the DB's curated model rows — zero network calls, and far
+  // more accurate than provider catalogs (Gemini still advertises retired ids
+  // like gemini-2.5-flash that 404 on chat). Only keys with NO rows at all
+  // (wildcards) ask their provider, and those fetches run concurrently.
+  const wildcards = eligible.filter((k) => !modelsByKey.get(k.id)?.length);
+  const liveById = new Map<number, { id: string }[]>();
+  await Promise.all(
+    wildcards.map(async (k) => {
+      const list = await keyModels(k.id);
+      liveById.set(k.id, list.map((m) => ({ id: m.id })));
+    })
   );
-  const catalogById = new Map<number, { id: string }[]>(catalogs);
 
   const candidates: RouteCandidate[] = [];
 
@@ -793,9 +833,11 @@ export async function selectRoute(
       if (keyUsed >= keyLimit) continue;
     }
 
-    const catalog = catalogById.get(k.id) ?? [];
-    if (!catalog.length) continue;
     const modelRows = modelsByKey.get(k.id) ?? [];
+    const catalog: { id: string }[] = modelRows.length
+      ? modelRows.filter((r) => r.enabled).map((r) => ({ id: r.model }))
+      : liveById.get(k.id) ?? [];
+    if (!catalog.length) continue;
 
     for (const m of catalog) {
       const rowForModel = modelRows.find((r) => r.model === m.id);
@@ -807,6 +849,7 @@ export async function selectRoute(
       // no rows at all -> wildcard key, serves anything it can list
 
       if (!want.auto && !matchesPinned(want, requested, providerId, m.id)) continue;
+      if (excludeModels.includes(m.id)) continue; // upstream already said this model is gone
 
       const b = bucketOf(k.id, m.id);
       const tpd = rowForModel?.token_limit || 0;
@@ -832,6 +875,7 @@ export async function selectRoute(
         model: m.id,
         score,
         rank: rankOf(providerId),
+        pref: prefOf(providerId, m.id),
         tokensToday: b.tokens,
         hitsToday: b.hits,
       });
@@ -841,13 +885,17 @@ export async function selectRoute(
   if (!candidates.length) {
     const why = want.auto
       ? "No model on any key has capacity left."
-      : "No key can serve '" + requested + "' with capacity left.";
+      : "No key can serve '" + requested + "' (model unavailable, or out of capacity).";
     return { choice: null, reason: why };
   }
 
-  // Dashboard provider order wins first; capacity decides within a provider.
+  // Dashboard provider order wins first; the dashboard default-model list
+  // breaks ties within a provider; capacity decides after that. Without the
+  // preference step an auto request can land on a model the provider still
+  // lists but refuses to serve (e.g. retired gemini-2.5-flash → 404).
   candidates.sort(
-    (a, b) => a.rank - b.rank || b.score - a.score || a.key.id - b.key.id || a.model.localeCompare(b.model)
+    (a, b) =>
+      a.rank - b.rank || a.pref - b.pref || b.score - a.score || a.key.id - b.key.id || a.model.localeCompare(b.model)
   );
 
   const top = candidates[0];

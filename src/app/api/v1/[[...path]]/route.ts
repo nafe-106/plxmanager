@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import { decrypt } from "@/lib/crypto";
 import {
   resolveGeneralKeyFromRequest,
-  pickProviderKey,
+  selectRoute,
+  analyzeRequestedModel,
   logProxyUsage,
   upstreamUrl,
   upstreamHeaders,
@@ -10,8 +11,7 @@ import {
   SseUsageCollector,
   gatewayInfo,
   mergedModelCatalog,
-  modelsForRequest,
-  splitGatewayModel,
+  type RouteChoice,
   CORS_HEADERS,
 } from "@/lib/general";
 
@@ -100,26 +100,25 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
 
   const maxAttempts = 2; // one retry on a different key if the first fails pre-response
   let lastError = "";
-
-  // "groq/openai/gpt-oss-120b" → route to groq keys with "openai/gpt-oss-120b".
-  const split = model ? splitGatewayModel(model) : null;
-  const upstreamModel = split?.upstream || "";
-
-  // Restrict to keys whose live model catalog actually serves this model
-  // (falls back to all eligible keys when no catalog is reachable).
-  const { keys: candidates } = await modelsForRequest(gk.id, model || undefined);
+  const tried: number[] = [];
+  const asked = analyzeRequestedModel(model);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const picked = await pickProviderKey(gk.id, upstreamModel || undefined, candidates);
-    if (!picked) {
+    // THE MANAGER picks model + key together: dashboard provider priority
+    // first, then whichever candidate still has the most capacity.
+    const routed = await selectRoute(model || undefined, { exclude: tried });
+    if (!routed.choice) {
       return errorJson(
-        model ? 404 : 503,
-        model
-          ? `No enabled API key can serve model '${model}'. Add the model to a key or clear its model list.`
-          : "No enabled API keys available. Add or enable keys first.",
-        model ? "model_not_found" : "service_unavailable"
+        asked.auto ? 503 : 404,
+        routed.reason,
+        asked.auto ? "service_unavailable" : "model_not_found"
       );
     }
+    const choice: RouteChoice = routed.choice;
+    tried.push(choice.key.id);
+    const picked = { row: choice.key, used: choice.tokensToday, limit: 0, ratio: choice.score };
+    const upstreamModel = choice.model;
+    const substituted = !asked.auto && !!asked.upstream && asked.upstream !== choice.model;
 
     let plain = "";
     try {
@@ -172,7 +171,7 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
       if (attempt < maxAttempts) continue;
     }
 
-    return finish(req, res, gk.id, picked, upstreamModel || model);
+    return finish(req, res, gk.id, picked, upstreamModel || model, choice, substituted, model);
   }
 
   return errorJson(502, `All routed keys failed. Last error: ${lastError || "unknown"}`, "bad_gateway");
@@ -180,13 +179,35 @@ async function handle(req: Request, ctx: RouteCtx): Promise<Response> {
 
 // Relay the upstream response to the client and record usage on both the
 // selected provider key and the general key.
-async function finish(req: Request, res: Response, gkId: number, picked: { row: { id: number }; used: number; limit: number; ratio: number }, fallbackModel: string): Promise<Response> {
+async function finish(
+  req: Request,
+  res: Response,
+  gkId: number,
+  picked: { row: { id: number }; used: number; limit: number; ratio: number },
+  fallbackModel: string,
+  choice?: RouteChoice,
+  substituted?: boolean,
+  requestedModel?: string
+): Promise<Response> {
   const outHeaders = new Headers();
   const ct = res.headers.get("content-type") ?? "application/json";
   outHeaders.set("Content-Type", ct);
   for (const h of ["x-request-id", "openai-organization", "openai-processing-ms"]) {
     const v = res.headers.get(h);
     if (v) outHeaders.set(h, v);
+  }
+  // Make the manager's routing decision visible to clients/debugging.
+  if (choice) {
+    outHeaders.set("x-gateway-model", choice.gatewayId);
+    outHeaders.set("x-gateway-provider", choice.providerId);
+    outHeaders.set("x-gateway-key-id", String(choice.key.id));
+    outHeaders.set("x-gateway-capacity", choice.score.toFixed(3));
+    if (substituted && requestedModel) {
+      outHeaders.set("x-gateway-routed-from", requestedModel);
+      outHeaders.set("x-gateway-routed", "substituted");
+    } else {
+      outHeaders.set("x-gateway-routed", choice.auto ? "auto" : "pinned");
+    }
   }
   for (const [k, v] of Object.entries(CORS_HEADERS)) outHeaders.set(k, v);
   const status = res.status;

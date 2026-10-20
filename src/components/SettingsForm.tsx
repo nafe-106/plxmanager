@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Button, Card } from "./ui";
+import { PROVIDERS } from "@/lib/providers";
 
 type SettingsResponse = {
   settings: Record<string, string | { value: string; saved: boolean; preview: string }>;
@@ -49,6 +50,29 @@ export default function SettingsForm() {
     setValues((p) => ({ ...p, [key]: val }));
   }
 
+  // --- provider routing priority (highest first) ---
+  const priorityList = (values.provider_priority ?? "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
+  const missingProviders = PROVIDERS.filter((p) => !priorityList.includes(p.id));
+  const providerLabel = (id: string) => PROVIDERS.find((p) => p.id === id)?.label ?? id;
+  const providerColor = (id: string) => PROVIDERS.find((p) => p.id === id)?.color ?? "#71717a";
+
+  function movePriority(i: number, dir: -1 | 1) {
+    const arr = [...priorityList];
+    const j = i + dir;
+    if (j < 0 || j >= arr.length) return;
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+    setVal("provider_priority", arr.join(","));
+  }
+  function addPriority(id: string) {
+    setVal("provider_priority", [...priorityList, id].join(","));
+  }
+  function dropPriority(id: string) {
+    setVal("provider_priority", priorityList.filter((p) => p !== id).join(","));
+  }
+
   async function save(e: React.FormEvent) {
     e.preventDefault();
     const body: Record<string, unknown> = {
@@ -69,6 +93,7 @@ export default function SettingsForm() {
       plexus_brain_model: values.plexus_brain_model,
       plexus_vision_model: values.plexus_vision_model,
       plexus_extra_models: values.plexus_extra_models,
+      provider_priority: priorityList.join(","),
     };
     if (newPassword.trim()) body.admin_password = newPassword.trim();
     if (resetPassword) body.admin_password_reset = true;
@@ -178,6 +203,64 @@ export default function SettingsForm() {
           <input type="checkbox" checked={!!checks.plexus_auto_switch} onChange={(e) => setChecks((p) => ({ ...p, plexus_auto_switch: e.target.checked }))} />
           Auto-switch accounts when GPU limit is reached
         </label>
+      </Card>
+
+      <Card className="space-y-3">
+        <h3 className="text-sm font-semibold text-zinc-200">Model routing</h3>
+        <p className="text-xs text-zinc-500">
+          The manager picks the model <b>and</b> the API key together on every request: it tries providers in the order
+          below first, and within a provider picks whichever key/model still has the most capacity left (tpd, rpd, rpm,
+          tpm). Order highest priority first. Clients can pin a model — if it has no capacity left, the manager
+          substitutes one and returns <span className="font-mono">x-gateway-routed-from</span>.
+        </p>
+        {priorityList.length === 0 ? (
+          <p className="text-xs text-amber-400">
+            No providers listed — every provider will be treated as equal priority.
+          </p>
+        ) : (
+          <ol className="space-y-1.5">
+            {priorityList.map((id, i) => (
+              <li
+                key={id}
+                className="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm"
+              >
+                <span className="w-6 tabular-nums text-zinc-500">{i + 1}.</span>
+                <span className="h-2.5 w-2.5 rounded-full" style={{ background: providerColor(id) }} />
+                <span className="text-zinc-200">{providerLabel(id)}</span>
+                <span className="font-mono text-[11px] text-zinc-600">{id}</span>
+                <span className="ml-auto flex gap-1">
+                  <button type="button" onClick={() => movePriority(i, -1)} disabled={i === 0}
+                    className="rounded border border-zinc-700 px-2 py-0.5 text-zinc-400 hover:border-emerald-600 hover:text-emerald-300 disabled:opacity-30">
+                    ↑
+                  </button>
+                  <button type="button" onClick={() => movePriority(i, 1)} disabled={i === priorityList.length - 1}
+                    className="rounded border border-zinc-700 px-2 py-0.5 text-zinc-400 hover:border-emerald-600 hover:text-emerald-300 disabled:opacity-30">
+                    ↓
+                  </button>
+                  <button type="button" onClick={() => dropPriority(id)}
+                    className="rounded border border-zinc-700 px-2 py-0.5 text-zinc-500 hover:border-red-700 hover:text-red-400">
+                    ✕
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ol>
+        )}
+        {missingProviders.length > 0 && (
+          <label className="flex items-center gap-2 text-xs text-zinc-500">
+            <span>Add provider:</span>
+            <select className={inputCls + " max-w-56 py-1"} value=""
+              onChange={(e) => { if (e.target.value) addPriority(e.target.value); }}>
+              <option value="">choose…</option>
+              {missingProviders.map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+          </label>
+        )}
+        <p className="text-[11px] text-zinc-600">
+          Saved as <span className="font-mono">{priorityList.join(",") || "(empty)"}</span>
+        </p>
       </Card>
 
       <Card className="space-y-3">

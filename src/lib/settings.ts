@@ -20,6 +20,9 @@ export const SETTING_DEFAULTS: Record<string, string> = {
   plexus_brain_model: "qwen3:30b",
   plexus_vision_model: "qwen2.5vl:7b",
   plexus_extra_models: "",
+  // Provider routing order, highest priority first. Comma-separated provider
+  // ids; anything not listed is tried last. Edited from the dashboard.
+  provider_priority: "groq,gemini,cerebras,openai,xai,openrouter,other",
 };
 
 // Allow the Plexus/Supabase settings to be supplied via env vars instead of
@@ -66,4 +69,20 @@ export async function updateSettings(patch: Record<string, string>): Promise<voi
     if (!(k in SETTING_DEFAULTS)) continue;
     await setSetting(k, v);
   }
+}
+
+// Dashboard-ordered provider priority (highest first). Unknown/blank ids are
+// dropped; ids in PROVIDERS but absent from the setting land AFTER the list.
+export function parseProviderPriority(raw: string | null | undefined): string[] {
+  return (raw || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
+}
+
+export async function providerPriority(): Promise<string[]> {
+  // getSetting() reads the DB/env only — it does NOT consult SETTING_DEFAULTS,
+  // so fall back here or an untouched install would route with an empty list.
+  const raw = (await getSetting("provider_priority")) ?? SETTING_DEFAULTS.provider_priority;
+  return parseProviderPriority(raw);
 }

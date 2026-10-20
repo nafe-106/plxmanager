@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { byId, rows, row, insertRow, insertMany, updateRow, upsertRows, nowSql } from "./store";
 import { decrypt, encrypt } from "./crypto";
 import { getProvider, PROVIDERS } from "./providers";
-import { timezone, getSetting } from "./settings";
+import { timezone, getSetting, providerPriority } from "./settings";
 import {
   dayKeyFromParts,
   tzParts,
@@ -569,12 +569,17 @@ async function keyModels(keyId: number): Promise<{ id: string; owned_by?: string
     return cached.models;
   }
   const fresh = await fetchKeyModels(keyId);
-  const dbRows = await rows<{ id: string }>("key_models", { key_id: keyId, enabled: 1 });
+  const dbRows = await rows<{ model: string }>("key_models", { key_id: keyId, enabled: 1 });
   const base = fresh ? fresh.models : cached?.models ?? [];
   const merged = new Map<string, { id: string; owned_by?: string; context_length?: number }>();
   for (const m of base) merged.set(m.id, m);
+  // Union the admin's DB list by MODEL NAME (r.model). The row's numeric PK
+  // (r.id) must never be used here — it produced phantom entries like "69" and
+  // meant a pinned model that the provider no longer lists could not route.
   for (const r of dbRows) {
-    if (r.id !== undefined && !merged.has(r.id)) merged.set(r.id, r);
+    const name = typeof r.model === "string" ? r.model.trim() : "";
+    if (!name || merged.has(name)) continue;
+    merged.set(name, { id: name });
   }
   const arr = [...merged.values()];
   catalogCache.set(keyId, { models: arr, fetchedAt: fresh?.fetchedAt ?? Date.now() });
@@ -662,6 +667,194 @@ async function keyEligible(r: ApiKeyRow, model: string | undefined, zone: string
   if (limit > 0 && used >= limit) return false;
   if (model && (await modelRpdLeft(r.id, model, zone)) === 0) return false;
   return true;
+}
+
+// ----- Capacity + priority routing ------------------------------------------
+// THE MANAGER picks the model AND the key together. A client may pin a model,
+// but the router freely picks another one when the pinned model has no
+// capacity left, and chooses automatically when no model is specified.
+
+const AUTO_TOKENS = new Set(["", "*", "auto", "any", "random", "route", "default"]);
+
+// What the client asked for, normalized.
+export interface RequestedModel {
+  auto: boolean; // manager must choose the model
+  providerHint: string | null; // "groq/" constrains the provider, frees the model
+  upstream: string; // bare model when pinned, "" when auto
+}
+
+export function analyzeRequestedModel(raw: string | undefined): RequestedModel {
+  const s = String(raw ?? "").trim();
+  if (!s || AUTO_TOKENS.has(s.toLowerCase())) return { auto: true, providerHint: null, upstream: "" };
+  if (s.endsWith("/")) {
+    const head = s.slice(0, -1).toLowerCase();
+    return { auto: true, providerHint: PROVIDERS.some((p) => p.id === head) ? head : null, upstream: "" };
+  }
+  const split = splitGatewayModel(s);
+  return { auto: false, providerHint: split.provider, upstream: split.upstream };
+}
+
+export interface RouteCandidate {
+  key: ApiKeyRow;
+  providerId: string;
+  gatewayId: string;
+  model: string;
+  score: number; // 0..1 headroom, 1 = wide open
+  rank: number;
+  tokensToday: number;
+  hitsToday: number;
+}
+
+export interface RouteChoice extends RouteCandidate {
+  auto: boolean;
+}
+
+export interface RouteResult {
+  choice: RouteChoice | null;
+  reason: string;
+}
+
+// Daily caps (tpd / rpd) are enforced exactly against today's buckets.
+// Per-MINUTE caps cannot be measured from hourly buckets, so they are scored
+// against the current hour using an hourly-equivalent budget (rate x 60) as
+// soft pressure only — never a hard rejection on their own.
+export async function selectRoute(
+  requested: string | undefined,
+  opts: { priority?: string[]; exclude?: number[] } = {}
+): Promise<RouteResult> {
+  const want = analyzeRequestedModel(requested);
+  const zone = await timezone();
+  const scope = await usageScope(zone);
+  const priority = opts.priority ?? (await providerPriority());
+  const exclude = opts.exclude ?? [];
+  const hourNow = tzParts(zone).hour;
+
+  const [eligible, todayRows, allModels] = await Promise.all([
+    rows<ApiKeyRow>("api_keys", { disabled: 0, status: { neq: "dead" } }, { order: "id" }),
+    rows<HourlyRow>("key_usage_hourly", { day: scope.today }),
+    rows<KeyModelRow>("key_models", {}, { order: "id" }),
+  ]);
+
+  const rankOf = (p: string) => {
+    const i = priority.indexOf(p);
+    return i === -1 ? priority.length : i;
+  };
+
+  type Bucket = { tokens: number; hits: number; hourTokens: number; hourHits: number };
+  const usage = new Map<string, Bucket>();
+  const bucketOf = (keyId: number, model: string): Bucket => {
+    const k = String(keyId) + "|" + model;
+    let b = usage.get(k);
+    if (!b) {
+      b = { tokens: 0, hits: 0, hourTokens: 0, hourHits: 0 };
+      usage.set(k, b);
+    }
+    return b;
+  };
+  for (const r of todayRows) {
+    const b = bucketOf(r.key_id, r.model);
+    b.tokens += r.tokens ?? 0;
+    b.hits += r.hits ?? 0;
+    if (r.hour === hourNow) {
+      b.hourTokens += r.tokens ?? 0;
+      b.hourHits += r.hits ?? 0;
+    }
+  }
+
+  const modelsByKey = new Map<number, KeyModelRow[]>();
+  for (const m of allModels) {
+    const arr = modelsByKey.get(m.key_id);
+    if (arr) arr.push(m);
+    else modelsByKey.set(m.key_id, [m]);
+  }
+
+  const candidates: RouteCandidate[] = [];
+
+  for (const k of eligible) {
+    if (exclude.includes(k.id)) continue; // already tried and failed this request
+    const providerId = getProvider(k.provider).id;
+    // The provider hint constrains AUTO picks. For a pinned model it is only a
+    // hint — Groq hosts real ids like "openai/gpt-oss-120b", so a hard filter
+    // here would reject the very provider that serves the model.
+    if (want.auto && want.providerHint && providerId !== want.providerHint) continue;
+
+    // Key-level period limit (provider-reported or user-configured).
+    const keyLimit = k.provider_limit ?? k.usage_limit ?? 0;
+    const keyUsed = k.provider_usage !== null ? k.provider_usage : await periodTokensUsed(k.id, k.usage_period, zone);
+    if (keyLimit > 0 && keyUsed >= keyLimit) continue;
+
+    const catalog = await keyModels(k.id);
+    if (!catalog.length) continue;
+    const modelRows = modelsByKey.get(k.id) ?? [];
+
+    for (const m of catalog) {
+      const rowForModel = modelRows.find((r) => r.model === m.id);
+      if (rowForModel) {
+        if (!rowForModel.enabled) continue;
+      } else if (modelRows.length) {
+        continue; // key tracks models and this one is not listed
+      }
+      // no rows at all -> wildcard key, serves anything it can list
+
+      if (!want.auto && !matchesPinned(want, requested, providerId, m.id)) continue;
+
+      const b = bucketOf(k.id, m.id);
+      const tpd = rowForModel?.token_limit || 0;
+      const rpd = rowForModel?.rpd || 0;
+      const rpm = rowForModel?.rpm || 0;
+      const tpm = rowForModel?.tpm || 0;
+
+      if (tpd > 0 && b.tokens >= tpd) continue; // daily token cap hit
+      if (rpd > 0 && b.hits >= rpd) continue; // daily request cap hit
+
+      const frac = (left: number, limit: number) => (limit > 0 ? Math.max(0, left) / limit : 1);
+      const score = Math.min(
+        frac(tpd - b.tokens, tpd),
+        frac(rpd - b.hits, rpd),
+        tpm > 0 ? 1 - Math.min(1, b.hourTokens / (tpm * 60)) : 1,
+        rpm > 0 ? 1 - Math.min(1, b.hourHits / (rpm * 60)) : 1
+      );
+
+      candidates.push({
+        key: k,
+        providerId,
+        gatewayId: providerId + "/" + m.id,
+        model: m.id,
+        score,
+        rank: rankOf(providerId),
+        tokensToday: b.tokens,
+        hitsToday: b.hits,
+      });
+    }
+  }
+
+  if (!candidates.length) {
+    const why = want.auto
+      ? "No model on any key has capacity left."
+      : "No key can serve '" + requested + "' with capacity left.";
+    return { choice: null, reason: why };
+  }
+
+  // Dashboard provider order wins first; capacity decides within a provider.
+  candidates.sort(
+    (a, b) => a.rank - b.rank || b.score - a.score || a.key.id - b.key.id || a.model.localeCompare(b.model)
+  );
+
+  const top = candidates[0];
+  return { choice: { ...top, auto: want.auto }, reason: "" };
+}
+
+// Does a candidate match the model the client pinned?
+function matchesPinned(want: RequestedModel, raw: string | undefined, providerId: string, modelId: string): boolean {
+  const pinned = want.upstream;
+  if (!pinned) return false;
+  const rawStr = String(raw ?? "").trim();
+  const gatewayId = providerId + "/" + modelId;
+  // Exact ids win over any provider-hint interpretation.
+  if (rawStr && (rawStr === modelId || rawStr === gatewayId)) return true;
+  if (pinned === modelId || pinned === gatewayId) return true;
+  if (want.providerHint && want.providerHint !== providerId) return false;
+  return gatewayId === rawStr;
 }
 
 // Standard health response when a client probes the gateway root.
